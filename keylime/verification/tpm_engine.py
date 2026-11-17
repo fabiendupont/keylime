@@ -734,7 +734,10 @@ class TPMEngine(VerificationEngine):
             ima_log_item.results.certified_entry_count = self.attest_state.next_ima_ml_entry - starting_offset
 
         if not failure:
-            self.attestation.evaluation = "pass"
+            # Dual-factor attestation: do not override a failure recorded by another verification engine (e.g., the
+            # SPDM engine evaluating out-of-band evidence)
+            if self.attestation.evaluation != "fail":
+                self.attestation.evaluation = "pass"
             # Update the ORIGINAL agent object (self.attestation.agent), not the fresh agent (self.agent)
             # The fresh agent is used for reading policies but updates must go to the original
             self.attestation.agent.attestation_count += 1
