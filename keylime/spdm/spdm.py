@@ -28,6 +28,7 @@ from typing import Optional
 from cryptography import x509
 from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.asymmetric import ec, padding, rsa
+from cryptography.hazmat.primitives.asymmetric.utils import encode_dss_signature
 from cryptography.x509 import load_der_x509_certificate
 
 from keylime import cert_utils, keylime_logging
@@ -169,6 +170,30 @@ def parse_measurements(message: bytes) -> tuple[list[MeasurementBlock], bytes, i
     return blocks, nonce, opaque_length
 
 
+def signature_length(signing_algorithm: str) -> int:
+    """Return the length in bytes of an SPDM signature produced with the given signing algorithm.
+
+    SPDM conveys ECDSA signatures in raw r||s form (DER encoding is not used), so the length is fixed by the
+    curve; RSA signatures are of the key size.
+    """
+    lengths = {
+        "TPM_ALG_ECDSA_ECC_NIST_P256": 64,
+        "TPM_ALG_ECDSA_ECC_NIST_P384": 96,
+        "TPM_ALG_ECDSA_ECC_NIST_P521": 132,
+        "TPM_ALG_RSAPSS_2048": 256,
+        "TPM_ALG_RSAPSS_3072": 384,
+        "TPM_ALG_RSAPSS_4096": 512,
+        "TPM_ALG_RSASSA_2048": 256,
+        "TPM_ALG_RSASSA_3072": 384,
+        "TPM_ALG_RSASSA_4096": 512,
+    }
+
+    try:
+        return lengths[signing_algorithm]
+    except KeyError as e:
+        raise SpdmError(f"unsupported SPDM signing algorithm '{signing_algorithm}'") from e
+
+
 def verify_signature(
     message: bytes, signature: bytes, cert: x509.Certificate, hash_algorithm: str = "sha384"
 ) -> None:
@@ -186,13 +211,31 @@ def verify_signature(
         if isinstance(public_key, rsa.RSAPublicKey):
             public_key.verify(signature, message, padding.PKCS1v15(), hash_alg())
         elif isinstance(public_key, ec.EllipticCurvePublicKey):
-            public_key.verify(signature, message, ec.ECDSA(hash_alg()))
+            # SPDM conveys ECDSA signatures in raw r||s form; convert to the DER encoding expected by
+            # python-cryptography (falling back to DER if the signature is already in that form)
+            sig = _decode_ecdsa_signature(signature, public_key.curve)
+            public_key.verify(sig, message, ec.ECDSA(hash_alg()))
         else:
             raise SpdmError("unsupported key type in SPDM device certificate")
     except SpdmError:
         raise
     except Exception as e:
         raise SpdmError(f"signature over SPDM measurements message is invalid: {e}")
+
+
+def _decode_ecdsa_signature(signature: bytes, curve: ec.EllipticCurve) -> bytes:
+    """Convert a raw r||s SPDM ECDSA signature to DER encoding. Signatures already in DER form are returned
+    unchanged."""
+    coordinate_size = (curve.key_size + 7) // 8
+    raw_size = 2 * coordinate_size
+
+    if len(signature) == raw_size:
+        r = int.from_bytes(signature[:coordinate_size], "big")
+        s = int.from_bytes(signature[coordinate_size:], "big")
+        return encode_dss_signature(r, s)
+
+    # Already DER-encoded
+    return signature
 
 
 def find_nonce_offset(message: bytes) -> int:

@@ -11,6 +11,7 @@ import unittest
 from cryptography import x509
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import ec
+from cryptography.hazmat.primitives.asymmetric.utils import decode_dss_signature
 from cryptography.x509.oid import NameOID
 
 from keylime.spdm import (
@@ -18,6 +19,8 @@ from keylime.spdm import (
     SpdmError,
     parse_cert_chain,
     parse_measurements,
+    signature_length,
+    split_signed_message,
     verify_cert_chain,
     verify_signature,
 )
@@ -201,6 +204,36 @@ class TestSignature(unittest.TestCase):
 
         with self.assertRaises(SpdmError):
             verify_signature(tampered, signature, device_cert, "sha384")
+
+    def test_verify_accepts_raw_spdm_signature(self):
+        # SPDM conveys ECDSA signatures in raw r||s form, not DER
+        device_key = _make_key()
+        device_cert = _make_cert(device_key)
+        nonce = b"\x22" * 32
+        message = _make_measurements_message(nonce)
+
+        der_signature = device_key.sign(message, ec.ECDSA(hashes.SHA384()))
+        r, s = decode_dss_signature(der_signature)
+        raw_signature = r.to_bytes(48, "big") + s.to_bytes(48, "big")
+
+        verify_signature(message, raw_signature, device_cert, "sha384")
+
+    def test_signature_length(self):
+        self.assertEqual(signature_length("TPM_ALG_ECDSA_ECC_NIST_P384"), 96)
+        self.assertEqual(signature_length("TPM_ALG_ECDSA_ECC_NIST_P256"), 64)
+        self.assertEqual(signature_length("TPM_ALG_RSAPSS_3072"), 384)
+
+        with self.assertRaises(SpdmError):
+            signature_length("TPM_ALG_UNKNOWN")
+
+    def test_split_signed_message(self):
+        message = b"\x12\x60\x00\x00" + b"\x00" * 100
+        signature = b"\x99" * 96
+        blob = message + signature
+
+        split_message, split_signature = split_signed_message(blob, 96)
+        self.assertEqual(split_message, message)
+        self.assertEqual(split_signature, signature)
 
 
 if __name__ == "__main__":

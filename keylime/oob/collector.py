@@ -25,6 +25,7 @@ import urllib3
 
 from keylime import config, keylime_logging
 from keylime.oob.redfish import RedfishClient, RedfishError
+from keylime.spdm import SpdmError, signature_length, split_signed_message
 
 logger = keylime_logging.init_logging("oob_collector")
 
@@ -135,7 +136,6 @@ class OOBCollector:
 
         for item, component in zip(evidence_requested, components):
             challenge = (item.get("chosen_parameters") or {}).get("challenge")
-            hash_algorithm = (item.get("chosen_parameters") or {}).get("hash_algorithm") or "sha384"
 
             if not challenge:
                 logger.error("Verifier did not provide a challenge for spdm_measurements evidence")
@@ -150,13 +150,34 @@ class OOBCollector:
                 logger.error("Could not collect signed measurements from '%s': %s", component["_uri"], e)
                 return False
 
-            message = measurement.get("SignedMeasurements")
-            signature = measurement.get("Signature")
+            signed_blob_b64 = measurement.get("SignedMeasurements")
+            signing_algorithm = measurement.get("SigningAlgorithm")
+            hash_algorithm = measurement.get("HashingAlgorithm") or "sha384"
+            cert_chain_b64 = measurement.get("CertificateChain") or self.cert_chain_b64
 
-            if not message or not signature:
+            if not signed_blob_b64 or not signing_algorithm:
                 logger.error(
-                    "Redfish response for '%s' did not include SignedMeasurements and Signature", component["_uri"]
+                    "Redfish response for '%s' did not include SignedMeasurements and SigningAlgorithm",
+                    component["_uri"],
                 )
+                return False
+
+            if not cert_chain_b64:
+                logger.error(
+                    "No SPDM certificate chain available for '%s' (neither in the Redfish response nor via "
+                    "--cert-chain)",
+                    component["_uri"],
+                )
+                return False
+
+            # The Redfish action returns the full signed statement (message plus trailing SPDM signature) as a
+            # single Base64 blob; split it so the verifier's SPDM engine receives message and signature separately
+            try:
+                signed_blob = base64.b64decode(signed_blob_b64)
+                sig_length = signature_length(signing_algorithm)
+                message, signature = split_signed_message(signed_blob, sig_length)
+            except SpdmError as e:
+                logger.error("Could not process signed measurements from '%s': %s", component["_uri"], e)
                 return False
 
             evidence_collected.append(
@@ -164,9 +185,9 @@ class OOBCollector:
                     "evidence_class": "certification",
                     "evidence_type": "spdm_measurements",
                     "data": {
-                        "message": message,
-                        "signature": signature,
-                        "meta": {"spdm_cert_chain": self.cert_chain_b64, "hash_algorithm": hash_algorithm},
+                        "message": base64.b64encode(message).decode("utf-8"),
+                        "signature": base64.b64encode(signature).decode("utf-8"),
+                        "meta": {"spdm_cert_chain": cert_chain_b64, "hash_algorithm": hash_algorithm},
                     },
                 }
             )

@@ -3,6 +3,8 @@ from keylime.spdm.spdm import (
     SpdmError,
     parse_cert_chain,
     parse_measurements,
+    signature_length,
+    split_signed_message,
     verify_cert_chain,
     verify_signature,
 )
@@ -12,6 +14,8 @@ __all__ = [
     "SpdmError",
     "parse_cert_chain",
     "parse_measurements",
+    "signature_length",
+    "split_signed_message",
     "verify_cert_chain",
     "verify_signature",
 ]

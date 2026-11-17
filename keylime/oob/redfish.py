@@ -75,7 +75,7 @@ class RedfishClient:
 
             resource = self._request("GET", uri).json()
 
-            if resource.get("ComponentType") != "SPDM":
+            if resource.get("ComponentIntegrityType") != "SPDM":
                 continue
 
             resource["_uri"] = uri
@@ -86,8 +86,10 @@ class RedfishClient:
     def get_signed_measurements(self, component_integrity, nonce_hex):
         """Trigger an SPDMGetSignedMeasurements action on a ComponentIntegrity resource.
 
-        The nonce (given as a hex string) becomes the SPDM challenge nonce which the device must include in its
-        signed measurements response. Returns the response as a JSON dict.
+        The nonce (a 32-byte value given as a hex string) becomes the SPDM challenge nonce which the device must
+        include in its signed measurements response. Returns the response as a JSON dict containing, per the
+        ComponentIntegrity schema, at least 'SignedMeasurements' (Base64 of the signed statement, signature
+        included), 'SigningAlgorithm' and 'HashingAlgorithm'.
         """
         actions = component_integrity.get("Actions", {})
         action = actions.get("#ComponentIntegrity.SPDMGetSignedMeasurements")
@@ -98,9 +100,9 @@ class RedfishClient:
             )
 
         payload = {
-            "ChallengeNonce": nonce_hex,
-            "MeasurementsRequested": "All",
-            "SignatureRequested": True,
+            "Nonce": nonce_hex,
+            "SlotId": 0,
+            "MeasurementIndices": [255],
         }
 
         return self._request("POST", action["target"], json=payload).json()
