@@ -76,8 +76,10 @@ class SPDMEngine(VerificationEngine):
         item.chosen_parameters.signature_scheme = item.capabilities.signature_schemes[0]
         item.chosen_parameters.hash_algorithm = (item.capabilities.hash_algorithms or ["sha384"])[0]
 
-        # Generate the freshness challenge which the BMC must include in the signed measurements
-        item.generate_challenge(128)
+        # Generate the freshness challenge which the BMC must include in the signed measurements. SPDM nonces
+        # are 32 bytes (DMTF DSP0274), so the challenge is 256 bits rather than the 128 bits used by other
+        # evidence types
+        item.generate_challenge(256)
 
         evidence_requested.append(item)
 

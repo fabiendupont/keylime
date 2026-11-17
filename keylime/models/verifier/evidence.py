@@ -503,7 +503,7 @@ class CertificationData(EvidenceData):
         super()._schema()
 
     def update(self, data):
-        self.cast_changes(data, ["subject_data", "message", "signature"])
+        self.cast_changes(data, ["subject_data", "message", "signature", "meta"])
 
         self.validate_required("message")
         self.validate_required("signature")

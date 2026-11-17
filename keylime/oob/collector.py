@@ -16,6 +16,7 @@ through its existing ZeroMQ/webhook framework, which downstream consumers
 
 import argparse
 import base64
+import json
 import sys
 import time
 from typing import Optional
@@ -25,6 +26,7 @@ import urllib3
 
 from keylime import config, keylime_logging
 from keylime.oob.redfish import RedfishClient, RedfishError
+from keylime.oob.tpm_identity import SwtpmIdentity, TpmIdentityError
 from keylime.spdm import SpdmError, signature_length, split_signed_message
 
 logger = keylime_logging.init_logging("oob_collector")
@@ -43,15 +45,17 @@ class OOBCollector:
         tls_key: Optional[str] = None,
         tls_ca_cert: Optional[str] = None,
         registrar_base_url: Optional[str] = None,
+        tpm: Optional[SwtpmIdentity] = None,
     ):
         self.agent_id = agent_id
         self.bmc = bmc
         self.verifier_base_url = verifier_base_url.rstrip("/")
         self.cert_chain_b64 = cert_chain_b64
         self.registrar_base_url = registrar_base_url.rstrip("/") if registrar_base_url else None
+        self.tpm = tpm
+        self.token: Optional[str] = None
 
         self.http = requests.Session()
-        self.http.headers.update({"Content-Type": "application/vnd.api+json"})
 
         if tls_cert and tls_key:
             self.http.cert = (tls_cert, tls_key)
@@ -61,15 +65,33 @@ class OOBCollector:
     def _json_api(self, attributes):
         return {"data": {"type": "attestation", "attributes": attributes}}
 
+    def _json_api_headers(self):
+        return {"Content-Type": "application/vnd.api+json"}
+
     def register_with_registrar(self):
-        """Register the device's SPDM certificate chain with the Keylime registrar."""
-        if not self.registrar_base_url or not self.cert_chain_b64:
+        """Register the device identity with the Keylime registrar.
+
+        When a TPM identity is available (swtpm), performs the full v2 registration protocol: EK/AK submission,
+        AK activation via MakeCredential/ActivateCredential. The SPDM certificate chain, if known, is included in
+        the same registration. Otherwise registers the SPDM certificate chain alone.
+        """
+        if not self.registrar_base_url:
             return
 
-        response = self.http.post(
-            f"{self.registrar_base_url}/v2/agents",
-            json={"agent_id": self.agent_id, "spdm_cert_chain": self.cert_chain_b64},
-        )
+        if self.tpm:
+            body = {
+                "ek_tpm": base64.b64encode(self.tpm.ek_tpm).decode("utf-8"),
+                "aik_tpm": base64.b64encode(self.tpm.ak_tpm).decode("utf-8"),
+            }
+        elif self.cert_chain_b64:
+            body = {"spdm_cert_chain": self.cert_chain_b64}
+        else:
+            return
+
+        if self.cert_chain_b64:
+            body["spdm_cert_chain"] = self.cert_chain_b64
+
+        response = self.http.post(f"{self.registrar_base_url}/v2/agents/{self.agent_id}", json=body)
 
         if response.status_code not in (200, 201):
             logger.error(
@@ -78,8 +100,159 @@ class OOBCollector:
                 response.status_code,
                 response.text[:200],
             )
+            return
+
+        logger.info("Registered identity for agent '%s' with registrar", self.agent_id)
+
+        # Activate the AK by decrypting the registrar's challenge and returning its HMAC
+        if self.tpm:
+            blob = (response.json().get("results") or {}).get("blob")
+            if not blob:
+                logger.error("Registrar did not return an AK challenge blob for agent '%s'", self.agent_id)
+                return
+
+            try:
+                auth_tag = self.tpm.activate_credential(base64.b64decode(blob), self.agent_id)
+            except TpmIdentityError as e:
+                logger.error("AK activation failed for agent '%s': %s", self.agent_id, e)
+                return
+
+            response = self.http.post(
+                f"{self.registrar_base_url}/v2/agents/{self.agent_id}/activate", json={"auth_tag": auth_tag}
+            )
+
+            if response.status_code == 200:
+                logger.info("Activated AK for agent '%s' with registrar", self.agent_id)
+            else:
+                logger.error(
+                    "AK activation rejected for agent '%s' (status %s): %s",
+                    self.agent_id,
+                    response.status_code,
+                    response.text[:200],
+                )
+
+    def enroll_with_verifier(self):
+        """Enroll the agent with the verifier (v2 API, requires an admin TLS client certificate)."""
+        if not self.tpm:
+            logger.warning("Verifier enrollment requires a TPM identity (--swtpm-socket)")
+            return
+
+        body = {
+            "v": None,
+            "verifier_ip": None,
+            "verifier_port": None,
+            "tpm_policy": json.dumps({}),
+            "runtime_policy": "",
+            "runtime_policy_name": "",
+            "runtime_policy_key": "",
+            "mb_policy": None,
+            "mb_policy_name": "",
+            "ima_sign_verification_keys": "",
+            "metadata": json.dumps({}),
+            "revocation_key": "",
+            "accept_tpm_hash_algs": ["sha256", "sha384"],
+            "accept_tpm_encryption_algs": ["rsa", "ecc"],
+            "accept_tpm_signing_algs": ["rsassa", "rsapss", "ecdsa"],
+            "ak_tpm": base64.b64encode(self.tpm.ak_tpm).decode("utf-8"),
+            "mtls_cert": None,
+            "supported_version": "2.0",
+        }
+
+        response = self.http.post(f"{self.verifier_base_url}/v2/agents/{self.agent_id}", json=body)
+
+        if response.status_code in (200, 201):
+            logger.info("Enrolled agent '%s' with verifier", self.agent_id)
+        elif response.status_code == 409:
+            logger.info("Agent '%s' already enrolled with verifier", self.agent_id)
         else:
-            logger.info("Registered SPDM certificate chain for agent '%s' with registrar", self.agent_id)
+            logger.error(
+                "Verifier enrollment failed for agent '%s' (status %s): %s",
+                self.agent_id,
+                response.status_code,
+                response.text[:300],
+            )
+
+    def authenticate(self):
+        """Obtain a bearer token from the verifier by proving possession of the AK (tpm_pop)."""
+        if not self.tpm:
+            return
+
+        response = self.http.post(
+            f"{self.verifier_base_url}/v3/sessions",
+            json={
+                "data": {
+                    "type": "session",
+                    "attributes": {
+                        "agent_id": self.agent_id,
+                        "authentication_supported": [
+                            {"authentication_class": "pop", "authentication_type": "tpm_pop"}
+                        ],
+                    },
+                }
+            },
+            headers=self._json_api_headers(),
+        )
+
+        if response.status_code not in (200, 201):
+            logger.error(
+                "Session creation failed for agent '%s' (status %s): %s",
+                self.agent_id,
+                response.status_code,
+                response.text[:300],
+            )
+            return
+
+        attributes = response.json()["data"]["attributes"]
+        session_id = response.json()["data"]["id"]
+        auth_requested = attributes.get("authentication_requested", [])
+        challenge = auth_requested[0].get("chosen_parameters", {}).get("challenge")
+
+        if not challenge:
+            logger.error("Verifier did not provide a session challenge for agent '%s'", self.agent_id)
+            return
+
+        nonce = base64.b64decode(challenge)
+        attest, signature = self.tpm.certify(nonce)
+
+        response = self.http.patch(
+            f"{self.verifier_base_url}/v3/sessions/{session_id}",
+            json={
+                "data": {
+                    "type": "session",
+                    "id": session_id,
+                    "attributes": {
+                        "agent_id": self.agent_id,
+                        "authentication_provided": [
+                            {
+                                "authentication_class": "pop",
+                                "authentication_type": "tpm_pop",
+                                "data": {
+                                    "message": base64.b64encode(attest).decode("utf-8"),
+                                    "signature": base64.b64encode(signature).decode("utf-8"),
+                                },
+                            }
+                        ],
+                    },
+                }
+            },
+            headers=self._json_api_headers(),
+        )
+
+        attributes = response.json().get("data", {}).get("attributes", {})
+
+        if response.status_code == 200 and attributes.get("evaluation") == "pass":
+            self.token = attributes.get("token")
+            logger.info("Authenticated agent '%s' with verifier (session token obtained)", self.agent_id)
+        else:
+            logger.error(
+                "Session PoP failed for agent '%s' (status %s): %s",
+                self.agent_id,
+                response.status_code,
+                response.text[:300],
+            )
+
+    def _auth_headers(self):
+        return {"Authorization": f"Bearer {self.token}"} if self.token else {}
 
     def attest_once(self):
         """Run a single attestation cycle. Returns True if evidence was submitted successfully."""
@@ -99,17 +272,37 @@ class OOBCollector:
                     "signature_schemes": ["ecdsa"],
                     "hash_algorithms": ["sha384"],
                     "certification_keys": [
-                        {"key_class": "asymmetric", "key_algorithm": "ec", "key_size": 384}
+                        {
+                            "key_class": "asymmetric",
+                            "key_algorithm": "ec",
+                            "key_size": 384,
+                            "server_identifier": "spdm_device",
+                        }
                     ],
                 },
             }
             for _ in components
         ]
 
+        # The verifier's schema requires a boot time. An out-of-band attested node has no guest OS to report a
+        # boot time from, so the collector reports the time of the attestation itself.
+        from datetime import datetime, timezone  # pylint: disable=import-outside-toplevel
+
+        boot_time = datetime.now(timezone.utc).isoformat()
+
         response = self.http.post(
             f"{self.verifier_base_url}/v{API_VERSION}/agents/{self.agent_id}/attestations",
-            json=self._json_api({"evidence_supported": capabilities, "system_info": {}}),
+            json=self._json_api({"evidence_supported": capabilities, "system_info": {"boot_time": boot_time}}),
+            headers={**self._json_api_headers(), **self._auth_headers()},
         )
+
+        if response.status_code == 401 and self.tpm:
+            self.authenticate()
+            response = self.http.post(
+                f"{self.verifier_base_url}/v{API_VERSION}/agents/{self.agent_id}/attestations",
+                json=self._json_api({"evidence_supported": capabilities, "system_info": {"boot_time": boot_time}}),
+                headers={**self._json_api_headers(), **self._auth_headers()},
+            )
 
         if response.status_code not in (200, 201):
             logger.error(
@@ -195,6 +388,7 @@ class OOBCollector:
         response = self.http.patch(
             f"{self.verifier_base_url}/v{API_VERSION}/agents/{self.agent_id}/attestations/latest",
             json=self._json_api({"evidence_collected": evidence_collected}),
+            headers={**self._json_api_headers(), **self._auth_headers()},
         )
 
         if response.status_code not in (200, 202):
@@ -209,8 +403,13 @@ class OOBCollector:
         logger.info("Submitted SPDM evidence for agent '%s'; verifier will appraise it asynchronously", self.agent_id)
         return True
 
-    def run(self, interval):
+    def run(self, interval, enroll=False):
         self.register_with_registrar()
+
+        if enroll:
+            self.enroll_with_verifier()
+
+        self.authenticate()
 
         while True:
             try:
@@ -265,6 +464,17 @@ def main():
         action="store_true",
         help="do not verify the TLS certificates of the BMC (use only for testing)",
     )
+    parser.add_argument(
+        "--swtpm-socket",
+        default=config.get("oob", "swtpm_socket", fallback=""),
+        help="unix socket of a swtpm instance providing the collector's TPM identity (enables registrar "
+        "registration, verifier enrollment and session authentication)",
+    )
+    parser.add_argument(
+        "--enroll",
+        action="store_true",
+        help="enroll the agent with the verifier (requires --swtpm-socket and an admin TLS client certificate)",
+    )
 
     args = parser.parse_args()
 
@@ -297,6 +507,15 @@ def main():
     if args.registrar_host:
         registrar_base_url = f"http://{args.registrar_host}:{args.registrar_port}"
 
+    tpm = None
+    if args.swtpm_socket:
+        tpm = SwtpmIdentity(args.swtpm_socket)
+        try:
+            tpm.initialize()
+        except TpmIdentityError as e:
+            logger.error("Could not establish swtpm TPM identity: %s", e)
+            sys.exit(1)
+
     collector = OOBCollector(
         agent_id=args.agent_uuid,
         bmc=bmc,
@@ -306,10 +525,11 @@ def main():
         tls_key=args.tls_key or None,
         tls_ca_cert=args.tls_ca_cert or None,
         registrar_base_url=registrar_base_url,
+        tpm=tpm,
     )
 
     try:
-        collector.run(args.interval)
+        collector.run(args.interval, enroll=args.enroll)
     except KeyboardInterrupt:
         logger.info("Shutting down OOB collector for agent '%s'", args.agent_uuid)
         bmc.close()
