@@ -58,6 +58,9 @@ WORK_DIR = os.getenv("KEYLIME_DIR", DEFAULT_WORK_DIR)
 # default templates directory
 TEMPLATES_DIR = "/usr/share/keylime/templates"
 
+# default trust store for SPDM device certificate chains (out-of-band attestation)
+SPDM_CERT_STORE = "/var/lib/keylime/spdm_cert_store"
+
 # allow testing mode
 TEST_MODE = environ_bool("KEYLIME_TEST", False)
 if TEST_MODE:

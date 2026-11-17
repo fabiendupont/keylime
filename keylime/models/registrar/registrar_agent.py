@@ -44,6 +44,9 @@ class RegistrarAgent(PersistableModel):
         cls._field("idevid_tpm", Binary(persist_as=String), nullable=True)
         # The initial device identity (IDevID) certificate used to verify IDevID authenticity
         cls._field("idevid_cert", Certificate, nullable=True)
+        # The SPDM device certificate chain (X.509/DICE) of an out-of-band attested device, provided as a
+        # base64-encoded SPDM certificate chain blob (DMTF DSP0274 CERTIFICATE format)
+        cls._field("spdm_cert_chain", Binary(persist_as=String), nullable=True)
         # The HMAC key used to verify the response produced by TPM2_ActivateCredential to bind the AK to the EK
         cls._field("key", String(45))
         # Indicates that the AK has successfully been bound to the EK
@@ -74,6 +77,34 @@ class RegistrarAgent(PersistableModel):
     def has_tpm_identity_violation(self):
         """Returns True if a TPM identity violation was detected during validation."""
         return getattr(self, "_tpm_identity_violation", False)
+
+    def _check_spdm_identity(self) -> None:
+        """Validate the SPDM device certificate chain of an out-of-band attested device."""
+        # Lazy import to avoid a circular dependency
+        from keylime.spdm import parse_cert_chain, verify_cert_chain  # pylint: disable=import-outside-toplevel
+
+        if "spdm_cert_chain" not in self.changes:
+            return
+
+        chain = self.changes.get("spdm_cert_chain")
+
+        if not chain:
+            return
+
+        trust_store = config.get("registrar", "spdm_cert_store", fallback=config.SPDM_CERT_STORE)
+
+        try:
+            certs = parse_cert_chain(chain)
+            verify_cert_chain(certs, trust_store)
+        except Exception as e:
+            self._add_error("spdm_cert_chain", f"must contain a valid SPDM certificate chain trusted by the registrar ({e})")
+            return
+
+        logger.info(
+            "Validated SPDM device certificate chain for agent '%s' (leaf subject: %s)",
+            self.agent_id,
+            certs[0].subject.rfc4514_string(),
+        )
 
     def _check_key_against_cert(self, tpm_key_field, cert_field):
         # If neither key nor certificate is being updated, no need to check
@@ -171,7 +202,7 @@ class RegistrarAgent(PersistableModel):
         # Define TPM identity fields that must remain immutable once set
         # Only checking EK-based identity (ek_tpm, ekcert, aik_tpm)
         # IAK/IDevID fields (iak_tpm, iak_cert, idevid_tpm, idevid_cert) are not checked
-        identity_fields = ["ek_tpm", "ekcert", "aik_tpm"]
+        identity_fields = ["ek_tpm", "ekcert", "aik_tpm", "spdm_cert_chain"]
 
         # Only check for existing agents (those loaded from database)
         # New agents created via empty() will have no committed values
@@ -341,8 +372,8 @@ class RegistrarAgent(PersistableModel):
             if not self.idevid_tpm and not self.ek_tpm:
                 self._add_error("idevid_tpm", "is required in absence of an EK")
 
-            if not self.ek_tpm and not self.iak_tpm and not self.idevid_tpm:
-                self._add_error("ek_tpm", "is required in absence of an IAK and IDevID")
+            if not self.ek_tpm and not self.iak_tpm and not self.idevid_tpm and not self.spdm_cert_chain:
+                self._add_error("ek_tpm", "is required in absence of an IAK, IDevID or SPDM device certificate chain")
 
         # If an IAK/IDevID is provided, ensure that IAK/IDevID certificates are also present. This requirement will be
         # dropped when IAK/IDevID registration without including certs is enabled (when web hook functionality is added)
@@ -374,8 +405,23 @@ class RegistrarAgent(PersistableModel):
         if "ek_tpm" in self.changes or "aik_tpm" in self.changes:
             self.active = False  # pylint: disable=attribute-defined-outside-init
 
+        # Agents registered with an SPDM device certificate chain have no AK which could be bound to an EK via
+        # MakeCredential/ActivateCredential. As the certificate chain has already been validated against the
+        # registrar's trust store, the agent is immediately active.
+        if self.spdm_cert_chain and not self.ek_tpm:
+            self.active = True  # pylint: disable=attribute-defined-outside-init
+
     def _prepare_regcount(self):
-        reg_fields = ("ek_tpm", "ekcert", "aik_tpm", "iak_tpm", "iak_cert", "idevid_tpm", "idevid_cert")
+        reg_fields = (
+            "ek_tpm",
+            "ekcert",
+            "aik_tpm",
+            "iak_tpm",
+            "iak_cert",
+            "idevid_tpm",
+            "idevid_cert",
+            "spdm_cert_chain",
+        )
 
         if self.regcount is None:  # pylint: disable=access-member-before-definition
             self.regcount = 0  # pylint: disable=attribute-defined-outside-init
@@ -388,7 +434,7 @@ class RegistrarAgent(PersistableModel):
         self.cast_changes(
             data,
             ["agent_id", "ek_tpm", "ekcert", "aik_tpm", "iak_tpm", "iak_cert", "idevid_tpm", "idevid_cert", "ip"]
-            + ["port", "mtls_cert"],
+            + ["port", "mtls_cert", "spdm_cert_chain"],
         )
 
         # SECURITY CHECK: Verify TPM identity is not being changed on re-registration
@@ -402,13 +448,17 @@ class RegistrarAgent(PersistableModel):
         self._check_ek()
         # Verify IAK/IDevID as valid and trusted
         self._check_iak_idevid(data.get("iak_attest"), data.get("iak_sign"))
-        # Ensure either an EK or IAK/IDevID is present, depending on configuration
+        # Verify SPDM device certificate chain as valid and trusted
+        self._check_spdm_identity()
+        # Ensure either an EK, IAK/IDevID or SPDM device certificate chain is present, depending on configuration
         self._check_root_identity_presence()
         # Handle certificates which are not fully compliant with ASN.1 DER
         self._check_all_cert_compliance()
 
-        # Basic validation of values
-        self.validate_required(["aik_tpm"])
+        # Basic validation of values. An AK is only required for TPM-based identity: agents registered with an
+        # SPDM device certificate chain (out-of-band attestation) do not have one.
+        if not self.spdm_cert_chain:
+            self.validate_required(["aik_tpm"])
         # Note: the data is validated as being Base64 encoded as part of the
         # cast method
 
@@ -418,6 +468,10 @@ class RegistrarAgent(PersistableModel):
         self._prepare_regcount()
 
     def produce_ak_challenge(self):
+        # Agents registered out-of-band with an SPDM device certificate chain do not produce an AK challenge
+        if self.spdm_cert_chain and not self.ek_tpm:
+            return None
+
         if not self.ek_tpm or not self.aik_tpm:
             return None
 
@@ -465,6 +519,9 @@ class RegistrarAgent(PersistableModel):
     def render(self, only=None):
         if not only:
             only = ["agent_id", "ek_tpm", "ekcert", "aik_tpm", "mtls_cert", "ip", "port", "regcount"]
+
+            if self.spdm_cert_chain:  # pylint: disable=using-constant-test  # ORM defensive programming
+                only.append("spdm_cert_chain")
 
             if self.virtual:  # pylint: disable=using-constant-test  # ORM defensive programming
                 only.append("provider_keys")

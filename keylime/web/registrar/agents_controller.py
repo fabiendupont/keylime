@@ -83,11 +83,12 @@ class AgentsController(Controller):
                 self.respond(403, "Agent re-registration with different TPM identity is forbidden for security reasons")
                 return
 
-            # Step 4: Generate AK challenge (inside lock)
+            # Step 4: Generate AK challenge (inside lock). Agents registered out-of-band with an SPDM device
+            # certificate chain have no AK to bind to an EK, so no challenge is produced
             challenge = agent.produce_ak_challenge()  # type: ignore[union-attr]
 
             # Step 5: Check for any validation errors or challenge generation failure
-            if not challenge or not agent.changes_valid:
+            if not agent.changes_valid or (not challenge and not agent.spdm_cert_chain):  # type: ignore[union-attr]
                 self.log_model_errors(agent, logger)
                 self.respond(400, "Could not register agent with invalid data")
                 return
