@@ -50,6 +50,7 @@ class Component(enum.Enum):
     IMA = "ima"
     INTERNAL = "internal"
     TEE = "tee_attestation"
+    SPDM = "spdm_attestation"
     DEFAULT = "default"
 
 
