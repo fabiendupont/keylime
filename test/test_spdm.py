@@ -1,0 +1,207 @@
+"""
+Unit tests for the keylime.spdm module (out-of-band SPDM evidence parsing and verification)
+"""
+
+# pylint: disable=protected-access
+
+import datetime
+import struct
+import unittest
+
+from cryptography import x509
+from cryptography.hazmat.primitives import hashes, serialization
+from cryptography.hazmat.primitives.asymmetric import ec
+from cryptography.x509.oid import NameOID
+
+from keylime.spdm import (
+    MeasurementBlock,
+    SpdmError,
+    parse_cert_chain,
+    parse_measurements,
+    verify_cert_chain,
+    verify_signature,
+)
+
+
+def _make_key(curve=ec.SECP384R1()):
+    return ec.generate_private_key(curve)
+
+
+def _make_cert(key, issuer_key=None, issuer_cert=None, cn="Test Device"):
+    issuer_key = issuer_key or key
+    issuer_cert_subject = issuer_cert.subject if issuer_cert else None
+
+    subject = issuer_name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, cn)])
+    if issuer_cert is not None:
+        issuer_name = issuer_cert_subject
+
+    return (
+        x509.CertificateBuilder()
+        .subject_name(subject)
+        .issuer_name(issuer_name)
+        .public_key(key.public_key())
+        .serial_number(x509.random_serial_number())
+        .not_valid_before(datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(days=1))
+        .not_valid_after(datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(days=365))
+        .sign(issuer_key, hashes.SHA384())
+    )
+
+
+def _chain_blob(certs):
+    """Serialise certificates into an SPDM certificate chain blob (length-prefixed)."""
+    body = b""
+    for cert in certs:
+        der = cert.public_bytes(serialization.Encoding.DER)
+        body += struct.pack("<H", len(der)) + der
+    return struct.pack("<H", len(body)) + body
+
+
+def _make_measurements_message(nonce, blocks=None, opaque=b""):
+    if blocks is None:
+        blocks = [
+            MeasurementBlock(index=1, measurement_spec=0x01, dmtf_spec=0x01, value_type=0x02, value=b"\xaa" * 48),
+            MeasurementBlock(index=2, measurement_spec=0x01, dmtf_spec=0x01, value_type=0x03, value=b"\xbb" * 48),
+        ]
+
+    record = b""
+    for block in blocks:
+        record += struct.pack("<BBBBH", block.index, block.measurement_spec, block.dmtf_spec, block.value_type, len(block.value))
+        record += block.value
+
+    message = struct.pack("<BBBBB", 0x12, 0x60, 0x00, 0x00, len(blocks))
+    message += struct.pack("<I", len(record)) + record
+    message += nonce
+    message += struct.pack("<H", len(opaque)) + opaque
+    return message
+
+
+class TestCertChain(unittest.TestCase):
+    def test_parse_roundtrip(self):
+        device_key = _make_key()
+        root_key = _make_key()
+        device_cert = _make_cert(device_key, issuer_key=root_key, cn="Device")
+        root_cert = _make_cert(root_key, cn="Root")
+
+        blob = _chain_blob([device_cert, root_cert])
+        certs = parse_cert_chain(blob)
+
+        self.assertEqual(len(certs), 2)
+        self.assertEqual(certs[0].subject, device_cert.subject)
+
+    def test_parse_rejects_short_blob(self):
+        with self.assertRaises(SpdmError):
+            parse_cert_chain(b"\x00")
+
+    def test_parse_rejects_bad_total_length(self):
+        device_cert = _make_cert(_make_key())
+        blob = _chain_blob([device_cert])
+        with self.assertRaises(SpdmError):
+            parse_cert_chain(blob + b"\xff\xff\xff")
+
+    def test_verify_chain(self):
+        device_key = _make_key()
+        root_key = _make_key()
+        root_cert = _make_cert(root_key, cn="Root")
+        device_cert = _make_cert(device_key, issuer_key=root_key, issuer_cert=root_cert, cn="Device")
+
+        # Use the test's own root certificate as the trust store anchor
+        import os
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as store:
+            with open(os.path.join(store, "root.pem"), "wb") as f:
+                f.write(root_cert.public_bytes(serialization.Encoding.PEM))
+
+            verify_cert_chain([device_cert, root_cert], store)
+
+    def test_verify_chain_rejects_untrusted_root(self):
+        device_key = _make_key()
+        root_key = _make_key()
+        root_cert = _make_cert(root_key, cn="Root")
+        device_cert = _make_cert(device_key, issuer_key=root_key, issuer_cert=root_cert, cn="Device")
+
+        other_root = _make_cert(_make_key(), cn="Other Root")
+
+        import os
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as store:
+            with open(os.path.join(store, "other.pem"), "wb") as f:
+                f.write(other_root.public_bytes(serialization.Encoding.PEM))
+
+            with self.assertRaises(SpdmError):
+                verify_cert_chain([device_cert, root_cert], store)
+
+
+class TestMeasurements(unittest.TestCase):
+    def test_parse_roundtrip(self):
+        nonce = b"\x11" * 32
+        message = _make_measurements_message(nonce)
+
+        blocks, parsed_nonce, opaque_length = parse_measurements(message)
+
+        self.assertEqual(len(blocks), 2)
+        self.assertEqual(blocks[0].index, 1)
+        self.assertEqual(blocks[0].value, b"\xaa" * 48)
+        self.assertEqual(blocks[1].index, 2)
+        self.assertEqual(parsed_nonce, nonce)
+        self.assertEqual(opaque_length, 0)
+
+    def test_parse_rejects_wrong_message_code(self):
+        nonce = b"\x00" * 32
+        message = _make_measurements_message(nonce)
+        message = bytes([message[0], 0x61]) + message[2:]
+
+        with self.assertRaises(SpdmError):
+            parse_measurements(message)
+
+    def test_parse_rejects_truncated_message(self):
+        with self.assertRaises(SpdmError):
+            parse_measurements(b"\x12\x60\x00\x00")
+
+    def test_parse_rejects_bad_block_count(self):
+        nonce = b"\x00" * 32
+        message = bytearray(_make_measurements_message(nonce))
+        message[4] = 3  # claim three blocks but only two present
+
+        with self.assertRaises(SpdmError):
+            parse_measurements(bytes(message))
+
+
+class TestSignature(unittest.TestCase):
+    def test_verify_valid_signature(self):
+        device_key = _make_key()
+        device_cert = _make_cert(device_key)
+        nonce = b"\x22" * 32
+        message = _make_measurements_message(nonce)
+
+        signature = device_key.sign(message, ec.ECDSA(hashes.SHA384()))
+        verify_signature(message, signature, device_cert, "sha384")
+
+    def test_verify_rejects_bad_signature(self):
+        device_key = _make_key()
+        other_key = _make_key()
+        device_cert = _make_cert(device_key)
+        nonce = b"\x22" * 32
+        message = _make_measurements_message(nonce)
+
+        signature = other_key.sign(message, ec.ECDSA(hashes.SHA384()))
+
+        with self.assertRaises(SpdmError):
+            verify_signature(message, signature, device_cert, "sha384")
+
+    def test_verify_rejects_tampered_message(self):
+        device_key = _make_key()
+        device_cert = _make_cert(device_key)
+        nonce = b"\x22" * 32
+        message = _make_measurements_message(nonce)
+
+        signature = device_key.sign(message, ec.ECDSA(hashes.SHA384()))
+        tampered = message[:-1] + bytes([message[-1] ^ 0xFF])
+
+        with self.assertRaises(SpdmError):
+            verify_signature(tampered, signature, device_cert, "sha384")
+
+
+if __name__ == "__main__":
+    unittest.main()

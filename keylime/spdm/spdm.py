@@ -59,8 +59,8 @@ def parse_cert_chain(blob: bytes) -> list[x509.Certificate]:
         raise SpdmError("SPDM certificate chain is too short")
 
     total_length = struct.unpack_from("<H", blob, 0)[0]
-    if total_length + 2 > len(blob):
-        raise SpdmError("SPDM certificate chain total length exceeds blob size")
+    if total_length + 2 != len(blob):
+        raise SpdmError("SPDM certificate chain total length does not match blob size")
 
     certs = []
     offset = 2
