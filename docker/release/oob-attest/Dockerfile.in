@@ -1,17 +1,31 @@
-FROM _source_keylime_base_digest_ AS keylime_oob_attest
+FROM registry.fedoraproject.org/fedora:45
 LABEL version="_version_" description="Keylime OOB Attestation Collector - Out-of-band SPDM hardware attestation"
 MAINTAINER Keylime Team <main@keylime.groups.io>
 
-# swtpm provides the collector's TPM identity device (the base image already
-# ships tpm2-tools, which the identity module drives over the swtpm socket)
-RUN dnf -y install swtpm && dnf clean all
+# Standalone build (not derived from keylime_base): the collector requires
+# tpm2-tools >= 5.8 for tpm2_certify qualifying data (session proof of
+# possession), which the current Fedora 44 based keylime_base does not ship.
+RUN dnf -y install \
+    awk \
+    dnf-plugins-core \
+    efivar-devel \
+    efivar-libs \
+    git \
+    nc \
+    python3-PyMySQL \
+    python3-jinja2 \
+    python3-psycopg2 \
+    tpm2-tools \
+    swtpm \
+    && dnf clean all
 
 RUN --mount=target=/keylime,type=bind,source=.,rw \
     cd /keylime && ./installer.sh -o
 
 # OpenShift's restricted SCC runs containers as a randomized non-root UID: make
 # the configuration files world-readable and the working directory writable so
-# the components work unchanged on such platforms
-RUN chmod a+r /etc/keylime/*.conf &&     chmod a+rwX /var/lib/keylime
+# the collector works unchanged on such platforms
+RUN chmod a+r /etc/keylime/*.conf && \
+    chmod a+rwX /var/lib/keylime
 
 ENTRYPOINT ["keylime_oob_attest"]

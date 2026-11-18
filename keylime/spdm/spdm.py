@@ -21,6 +21,8 @@ Structures follow the SPDM 1.x wire format:
         TotalLength(2) then, for each certificate, Length(2) + CertificateData(var)
 """
 
+import base64
+import re
 import struct
 from dataclasses import dataclass
 from typing import Optional
@@ -168,6 +170,28 @@ def parse_measurements(message: bytes) -> tuple[list[MeasurementBlock], bytes, i
     opaque_length = struct.unpack_from("<H", message, record_end + SPDM_NONCE_SIZE)[0]
 
     return blocks, nonce, opaque_length
+
+
+def chain_blob_from_pem(pem: str) -> bytes:
+    """Convert a PEM certificate chain (concatenated BEGIN/END CERTIFICATE blocks, leaf first), as served by
+    Redfish Certificate resources, into the DMTF DSP0274 chain blob format (2-byte total length, then
+    2-byte length-prefixed DER certificates)."""
+    certs = []
+
+    for match in re.finditer(
+        r"-----BEGIN CERTIFICATE-----(.*?)-----END CERTIFICATE-----", pem, re.DOTALL
+    ):
+        b64_body = "".join(match.group(1).split())
+        try:
+            certs.append(base64.b64decode(b64_body))
+        except Exception as e:
+            raise SpdmError(f"certificate in PEM chain is not valid Base64: {e}") from e
+
+    if not certs:
+        raise SpdmError("no certificates found in PEM chain")
+
+    body = b"".join(struct.pack("<H", len(der)) + der for der in certs)
+    return struct.pack("<H", len(body)) + body
 
 
 def signature_length(signing_algorithm: str) -> int:

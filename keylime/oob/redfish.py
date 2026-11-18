@@ -5,6 +5,8 @@ SPDM measurements out-of-band: session establishment and discovery of
 ComponentIntegrity resources exposing SPDM actions.
 """
 
+import time
+
 import requests
 
 from keylime import keylime_logging
@@ -87,9 +89,12 @@ class RedfishClient:
         """Trigger an SPDMGetSignedMeasurements action on a ComponentIntegrity resource.
 
         The nonce (a 32-byte value given as a hex string) becomes the SPDM challenge nonce which the device must
-        include in its signed measurements response. Returns the response as a JSON dict containing, per the
-        ComponentIntegrity schema, at least 'SignedMeasurements' (Base64 of the signed statement, signature
-        included), 'SigningAlgorithm' and 'HashingAlgorithm'.
+        include in its signed measurements response.
+
+        Handles both response styles: synchronous services return the measurement payload directly, while
+        SPDM-capable BMCs such as the NVIDIA GB300 NVL72 trays return HTTP 202 with a Task (gathering the
+        measurements means traversing MCTP to the device's root of trust, which is slow). For the task style,
+        the task is polled until completion and the payload is retrieved from the action's `/data` endpoint.
         """
         actions = component_integrity.get("Actions", {})
         action = actions.get("#ComponentIntegrity.SPDMGetSignedMeasurements")
@@ -105,7 +110,66 @@ class RedfishClient:
             "MeasurementIndices": [255],
         }
 
-        return self._request("POST", action["target"], json=payload).json()
+        response = self._request("POST", action["target"], json=payload)
+        body = self._json_or_empty(response)
+
+        if self._is_task(body):
+            return self._wait_for_measurement_task(action["target"], body)
+
+        return body
+
+    @staticmethod
+    def _json_or_empty(response):
+        try:
+            return response.json()
+        except ValueError:
+            return {}
+
+    @staticmethod
+    def _is_task(body):
+        odata_type = str(body.get("@odata.type", ""))
+        return "TaskState" in body or "Task" in odata_type
+
+    def _wait_for_measurement_task(self, action_target, task_body, timeout=60.0, poll_interval=0.2):
+        """Poll a Redfish task until completion, then fetch the measurement payload from the action's
+        `/data` endpoint (the convention used by SPDM-capable BMCs)."""
+        task_uri = task_body.get("@odata.id")
+
+        if not task_uri:
+            raise RedfishError("SPDM measurement task response did not include a task URI")
+
+        deadline = time.monotonic() + timeout
+
+        while time.monotonic() < deadline:
+            task = self._json_or_empty(self._request("GET", task_uri))
+            state = task.get("TaskState")
+
+            if state == "Completed":
+                return self._json_or_empty(self._request("GET", f"{action_target}/data"))
+
+            if state in ("Exception", "Killed", "Cancelled"):
+                messages = task.get("Messages", [])
+                raise RedfishError(f"SPDM measurement task failed with state '{state}': {messages}")
+
+            time.sleep(poll_interval)
+
+        raise RedfishError(f"SPDM measurement task did not complete within {timeout} seconds")
+
+    def get_certificate_chain_pem(self, link):
+        """Fetch a Redfish Certificate resource (given as a URI or a `{"@odata.id": ...}` link) and return its
+        `CertificateString`: the device's SPDM certificate chain as concatenated PEM."""
+        uri = link.get("@odata.id") if isinstance(link, dict) else link
+
+        if not uri:
+            raise RedfishError("certificate link did not include a URI")
+
+        certificate = self._json_or_empty(self._request("GET", uri))
+        pem = certificate.get("CertificateString")
+
+        if not pem:
+            raise RedfishError(f"certificate resource '{uri}' did not include a CertificateString")
+
+        return pem
 
     def close(self):
         self.session.close()

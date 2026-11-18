@@ -27,7 +27,7 @@ import urllib3
 from keylime import config, keylime_logging
 from keylime.oob.redfish import RedfishClient, RedfishError
 from keylime.oob.tpm_identity import SwtpmIdentity, TpmIdentityError
-from keylime.spdm import SpdmError, signature_length, split_signed_message
+from keylime.spdm import SpdmError, chain_blob_from_pem, signature_length, split_signed_message
 
 logger = keylime_logging.init_logging("oob_collector")
 
@@ -254,6 +254,26 @@ class OOBCollector:
     def _auth_headers(self):
         return {"Authorization": f"Bearer {self.token}"} if self.token else {}
 
+    def _resolve_cert_chain(self, measurement):
+        """Resolve the SPDM device certificate chain as Base64 of the DMTF DSP0274 blob, in order of
+        preference: the action response's 'Certificate' link (Redfish Certificate resource with a PEM
+        chain), the non-standard inline 'CertificateChain' property, or the collector's --cert-chain
+        fallback. Returns None when no source is available."""
+        certificate_link = measurement.get("Certificate")
+
+        if isinstance(certificate_link, dict) and certificate_link.get("@odata.id"):
+            try:
+                pem = self.bmc.get_certificate_chain_pem(certificate_link)
+                return base64.b64encode(chain_blob_from_pem(pem)).decode("utf-8")
+            except (RedfishError, SpdmError) as e:
+                logger.warning(
+                    "Could not fetch certificate chain from the linked Certificate resource, falling back to "
+                    "inline/--cert-chain: %s",
+                    e,
+                )
+
+        return measurement.get("CertificateChain") or self.cert_chain_b64
+
     def attest_once(self):
         """Run a single attestation cycle. Returns True if evidence was submitted successfully."""
         components = self.bmc.get_component_integrity()
@@ -346,7 +366,11 @@ class OOBCollector:
             signed_blob_b64 = measurement.get("SignedMeasurements")
             signing_algorithm = measurement.get("SigningAlgorithm")
             hash_algorithm = measurement.get("HashingAlgorithm") or "sha384"
-            cert_chain_b64 = measurement.get("CertificateChain") or self.cert_chain_b64
+
+            # Resolve the device certificate chain, in order of preference: the schema-conformant
+            # 'Certificate' link to a Redfish Certificate resource (as served by SPDM-capable BMCs), the
+            # non-standard inline 'CertificateChain' blob, or the collector's --cert-chain fallback
+            cert_chain_b64 = self._resolve_cert_chain(measurement)
 
             if not signed_blob_b64 or not signing_algorithm:
                 logger.error(

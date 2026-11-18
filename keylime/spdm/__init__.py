@@ -1,6 +1,7 @@
 from keylime.spdm.spdm import (
     MeasurementBlock,
     SpdmError,
+    chain_blob_from_pem,
     parse_cert_chain,
     parse_measurements,
     signature_length,
@@ -12,6 +13,7 @@ from keylime.spdm.spdm import (
 __all__ = [
     "MeasurementBlock",
     "SpdmError",
+    "chain_blob_from_pem",
     "parse_cert_chain",
     "parse_measurements",
     "signature_length",

@@ -17,6 +17,7 @@ from cryptography.x509.oid import NameOID
 from keylime.spdm import (
     MeasurementBlock,
     SpdmError,
+    chain_blob_from_pem,
     parse_cert_chain,
     parse_measurements,
     signature_length,
@@ -234,6 +235,30 @@ class TestSignature(unittest.TestCase):
         split_message, split_signature = split_signed_message(blob, 96)
         self.assertEqual(split_message, message)
         self.assertEqual(split_signature, signature)
+
+    def test_chain_blob_from_pem(self):
+        from cryptography.hazmat.primitives import serialization
+
+        device_key = _make_key()
+        root_key = _make_key()
+        root_cert = _make_cert(root_key, cn="Root")
+        device_cert = _make_cert(device_key, issuer_key=root_key, issuer_cert=root_cert, cn="Device")
+
+        pem = (
+            device_cert.public_bytes(serialization.Encoding.PEM).decode()
+            + root_cert.public_bytes(serialization.Encoding.PEM).decode()
+        )
+
+        blob = chain_blob_from_pem(pem)
+        certs = parse_cert_chain(blob)
+
+        self.assertEqual(len(certs), 2)
+        self.assertEqual(certs[0].subject, device_cert.subject)
+        self.assertEqual(certs[1].subject, root_cert.subject)
+
+    def test_chain_blob_from_pem_rejects_empty(self):
+        with self.assertRaises(SpdmError):
+            chain_blob_from_pem("not a pem at all")
 
 
 if __name__ == "__main__":
