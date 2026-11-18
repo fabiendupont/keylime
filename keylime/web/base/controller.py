@@ -552,10 +552,16 @@ class Controller:
             json_params = {}
 
             if content_type and Controller.JSON_MEDIA_TYPE_REGEX.match(content_type):
-                try:
-                    json_content = json.loads(self.request_body)
-                except json.JSONDecodeError as err:
-                    raise ParamDecodeError("request body not interpretable as valid JSON") from err
+                # Some HTTP clients (e.g., the Go keylime clients used by the attestation-operator) set a JSON
+                # Content-Type on requests regardless of method, including GETs with an empty body; treat an
+                # empty body as no parameters rather than malformed JSON
+                if not self.request_body:
+                    json_content = {}
+                else:
+                    try:
+                        json_content = json.loads(self.request_body)
+                    except json.JSONDecodeError as err:
+                        raise ParamDecodeError("request body not interpretable as valid JSON") from err
 
                 if isinstance(json_content, dict):
                     json_params = json_content
