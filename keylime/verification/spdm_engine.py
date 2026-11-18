@@ -222,15 +222,20 @@ class SPDMEngine(VerificationEngine):
                             True,
                         )
 
-        # Record parsed measurements in the evidence results for auditability
-        item.results.meta["measurements"] = [
-            {
-                "index": block.index,
-                "value_type": block.value_type,
-                "value": f"0x{block.value.hex()}",
-            }
-            for block in blocks
-        ]
+        # Record parsed measurements in the evidence results for auditability. Assign a new dict (rather than
+        # mutating in place) so the change is tracked by the model layer and persisted with the verification
+        # results
+        item.results.meta = {
+            **(item.results.meta or {}),
+            "measurements": [
+                {
+                    "index": block.index,
+                    "value_type": block.value_type,
+                    "value": f"0x{block.value.hex()}",
+                }
+                for block in blocks
+            ],
+        }
 
         self._process_results(failure)
 
