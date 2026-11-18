@@ -135,6 +135,11 @@ class EvidenceItem(PersistableModel):
         if self.data:
             output["data"] = self.data.render()
 
+        # Include the verification results, when they exist, so that API consumers can inspect what was
+        # appraised (e.g., the parsed SPDM measurements) rather than only the verdict
+        if self.results and self.results.meta:
+            output["results"] = self.results.render()
+
         return output
 
     def render_state(self):
