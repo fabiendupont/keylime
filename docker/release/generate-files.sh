@@ -11,7 +11,7 @@ DIGEST=${3:-""}
 
 # Docker only allows lower case repositories
 SOURCE=$(echo -n ${SOURCE} | tr '[:upper:]' '[:lower:]')
-for part in registrar verifier tenant; do
+for part in registrar verifier tenant oob-attest; do
   echo "Generating ${part}"
   sed "s#_version_#${VERSION}#" "${part}/Dockerfile.in" > ${part}/Dockerfile
   sed -i "s#_source_#${SOURCE}#" ${part}/Dockerfile

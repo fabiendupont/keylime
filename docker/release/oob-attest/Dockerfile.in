@@ -1,0 +1,12 @@
+FROM _source_keylime_base_digest_ AS keylime_oob_attest
+LABEL version="_version_" description="Keylime OOB Attestation Collector - Out-of-band SPDM hardware attestation"
+MAINTAINER Keylime Team <main@keylime.groups.io>
+
+# swtpm provides the collector's TPM identity device (the base image already
+# ships tpm2-tools, which the identity module drives over the swtpm socket)
+RUN dnf -y install swtpm && dnf clean all
+
+RUN --mount=target=/keylime,type=bind,source=.,rw \
+    cd /keylime && ./installer.sh -o
+
+ENTRYPOINT ["keylime_oob_attest"]

@@ -1,0 +1,103 @@
+# Example OpenShift/Kubernetes deployment of the Keylime OOB attestation
+# collector (keylime_oob_attest).
+#
+# The collector runs in the management plane and polls a BMC's Redfish
+# ComponentIntegrity endpoints, submitting signed SPDM measurements to the
+# Keylime verifier as spdm_measurements evidence. Its TPM identity (used for
+# registrar registration and verifier session authentication) is provided by
+# an swtpm sidecar so that no software is needed in the tenant OS.
+#
+# Adapt the BMC host/credentials, verifier/registrar locations, TLS material
+# and SPDM certificate chain before use. See
+# docs/design/oob_spdm_attestation.md for the full architecture.
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: keylime-oob-attest-config
+data:
+  # Command-line defaults; every option can also be passed as an argument to
+  # the container (see keylime_oob_attest --help)
+  oob.conf: |
+    [oob]
+    interval = 1800
+    bmc_username = root
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: keylime-oob-attest-secrets
+stringData:
+  bmc-password: changeme
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: keylime-oob-attest
+  labels:
+    app: keylime-oob-attest
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: keylime-oob-attest
+  template:
+    metadata:
+      labels:
+        app: keylime-oob-attest
+    spec:
+      containers:
+        - name: collector
+          image: quay.io/keylime/keylime-oob-attest:latest
+          args:
+            - --agent-uuid
+            - "94c56a96-1d2f-4a08-8b6c-6f8b1e2a9d01"   # node this collector attests
+            - --bmc-host
+            - bmc.example.com                          # BMC Redfish endpoint
+            - --verifier-host
+            - keylime-verifier.keylime.svc
+            - --verifier-port
+            - "8881"
+            - --registrar-host
+            - keylime-registrar.keylime.svc
+            - --registrar-port
+            - "8890"
+            - --swtpm-socket
+            - /swtpm/tpm.sock
+            - --cert-chain
+            - /etc/keylime/oob/spdm-cert-chain.blob   # device SPDM certificate chain
+            - --enroll
+          env:
+            - name: KEYLIME_OOB_CONFIG
+              value: /etc/keylime/oob/oob.conf
+            - name: KEYLIME_DIR
+              value: /var/lib/keylime
+          envFrom:
+            - secretRef:
+                name: keylime-oob-attest-secrets
+          volumeMounts:
+            - name: swtpm
+              mountPath: /swtpm
+            - name: config
+              mountPath: /etc/keylime/oob
+              readOnly: true
+        - name: swtpm
+          image: quay.io/keylime/keylime-oob-attest:latest
+          command:
+            - /bin/sh
+            - -c
+            - |
+              exec swtpm socket --tpm2 \
+                --tpmstate dir=/swtpm \
+                --server type=unixio,path=/swtpm/tpm.sock \
+                --ctrl type=unixio,path=/swtpm/tpm.sock.ctrl \
+                --flags not-need-init
+          volumeMounts:
+            - name: swtpm
+              mountPath: /swtpm
+      volumes:
+        - name: swtpm
+          emptyDir: {}
+        - name: config
+          configMap:
+            name: keylime-oob-attest-config
