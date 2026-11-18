@@ -1,0 +1,19 @@
+[Unit]
+Description=The Keylime out-of-band SPDM attestation collector
+After=network-online.target keylime-verifier.service
+Wants=network-online.target
+
+[Service]
+Group=keylime
+User=keylime
+ExecStart=/usr/bin/keylime_oob_attest
+TimeoutSec=60s
+Restart=on-failure
+RestartSec=120s
+
+# The collector reads its BMC endpoint, credentials, verifier and registrar
+# locations, swtpm socket and TLS material from /etc/keylime/oob.conf and the
+# corresponding environment. See docs/design/oob_spdm_attestation.md.
+
+[Install]
+WantedBy=default.target

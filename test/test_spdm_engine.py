@@ -145,8 +145,90 @@ class TestSPDMEngine(unittest.TestCase):
         json.dump({"1": "0x" + "bb" * 48}, policy_file)  # expected value differs from the signed measurement
         policy_file.close()
 
+        def json_config_get(section, option, fallback=None):
+            if option == "spdm_measurement_policy":
+                return policy_file.name
+            return fallback
+
         with patch.object(self.engine, "_trust_store", self._trust_store), patch(
-            "keylime.verification.spdm_engine.config.get", return_value=policy_file.name
+            "keylime.verification.spdm_engine.config.get", side_effect=json_config_get
+        ):
+            self.engine.verify_evidence()
+
+        self.assertEqual(self.mock_attestation.evaluation, "fail")
+        self.assertEqual(self.mock_attestation.failure_reason, "policy_violation")
+
+    def test_verify_evidence_corim_appraisal_pass(self):
+        import tempfile
+
+        from cryptography.hazmat.primitives.serialization import Encoding
+
+        from keylime.corim import sign_corim
+
+        signer_key = ec.generate_private_key(ec.SECP384R1())
+        signer_cert = _make_cert(signer_key, cn="corim-signer")
+
+        # CoMID measurement map declaring the digest of the signed measurement block (index 1, 0xaa * 48)
+        corim = {3: [{2: {0: b"test-tag"}, 8: [{1: {1: [{1: -35, 2: b"\xaa" * 48}]}}]}]}
+        blob = sign_corim(corim, signer_key)
+
+        corim_file = tempfile.NamedTemporaryFile(suffix=".corim", delete=False)  # pylint: disable=consider-using-with
+        self.addCleanup(os.unlink, corim_file.name)
+        corim_file.write(blob)
+        corim_file.close()
+
+        signer_dir = tempfile.TemporaryDirectory()  # pylint: disable=consider-using-with
+        self.addCleanup(signer_dir.cleanup)
+        with open(os.path.join(signer_dir.name, "signer.pem"), "wb") as f:
+            f.write(signer_cert.public_bytes(Encoding.PEM))
+
+        def fake_config_get(section, option, fallback=None):
+            if option == "spdm_corim":
+                return corim_file.name
+            if option == "spdm_corim_signers":
+                return signer_dir.name
+            return fallback
+
+        with patch.object(self.engine, "_trust_store", self._trust_store), patch(
+            "keylime.verification.spdm_engine.config.get", side_effect=fake_config_get
+        ):
+            self.engine.verify_evidence()
+
+        self.assertEqual(self.mock_attestation.evaluation, "pass")
+
+    def test_verify_evidence_corim_appraisal_fail(self):
+        import tempfile
+
+        from cryptography.hazmat.primitives.serialization import Encoding
+
+        from keylime.corim import sign_corim
+
+        signer_key = ec.generate_private_key(ec.SECP384R1())
+        signer_cert = _make_cert(signer_key, cn="corim-signer")
+
+        # Manifest declares a digest that does NOT match the signed measurement block
+        corim = {3: [{2: {0: b"test-tag"}, 8: [{1: {1: [{1: -35, 2: b"\xcc" * 48}]}}]}]}
+        blob = sign_corim(corim, signer_key)
+
+        corim_file = tempfile.NamedTemporaryFile(suffix=".corim", delete=False)  # pylint: disable=consider-using-with
+        self.addCleanup(os.unlink, corim_file.name)
+        corim_file.write(blob)
+        corim_file.close()
+
+        signer_dir = tempfile.TemporaryDirectory()  # pylint: disable=consider-using-with
+        self.addCleanup(signer_dir.cleanup)
+        with open(os.path.join(signer_dir.name, "signer.pem"), "wb") as f:
+            f.write(signer_cert.public_bytes(Encoding.PEM))
+
+        def fake_config_get(section, option, fallback=None):
+            if option == "spdm_corim":
+                return corim_file.name
+            if option == "spdm_corim_signers":
+                return signer_dir.name
+            return fallback
+
+        with patch.object(self.engine, "_trust_store", self._trust_store), patch(
+            "keylime.verification.spdm_engine.config.get", side_effect=fake_config_get
         ):
             self.engine.verify_evidence()
 

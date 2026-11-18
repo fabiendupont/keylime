@@ -47,9 +47,20 @@ verifies:
 2. the device's signature over the measurements message;
 3. the nonce embedded in the message against the verifier-issued challenge
    (freshness); and
-4. the measurement blocks against an optional JSON reference policy
-   (`verifier/spdm_measurement_policy`, mapping block indexes to expected hex
-   values). Without a policy, signature/freshness/trust checks apply only.
+4. the measurement blocks against a reference policy. Two policy mechanisms are
+   supported:
+
+   - **CoRIM/CoMID** (production): a signed vendor manifest (DMTF CoRIM, RATS
+     RFC 9334) given by `verifier/spdm_corim`, verified against the signer
+     certificates in `verifier/spdm_corim_signers` (default
+     `/var/lib/keylime/corim_signers`). SPDM measurement block indices are
+     matched against CoMID measurement maps; each block's digest must appear in
+     the manifest's declared digests, and every declared measurement must be
+     present in the evidence.
+   - **JSON allow-list** (simple deployments): `verifier/spdm_measurement_policy`,
+     a file mapping measurement block indexes to expected hex values.
+
+   Without either, signature/freshness/trust checks apply only.
 
 ## Dual-factor attestation (2FA)
 
@@ -71,7 +82,9 @@ quarantine nodes.
 - The collector's Redfish client covers `ComponentIntegrity` discovery and the
   `SPDMGetSignedMeasurements` action only; additional BMC implementations may
   require minor adaptation.
-- CoRIM/CoMID appraisal (RFC 9334 reference manifests) is future work; today a
-  simple JSON reference policy is used.
+- CoRIM support covers COSE_Sign1-signed manifests with ECDSA (ES256/384/512)
+  and RSASSA signatures, CoMID measurement maps keyed by measurement index, and
+  `x5chain` or pinned out-of-band signer certificates. Richer CoRIM features
+  (version ranges, SVN comparators, environment maps) are future work.
 - Enrollment of fully TPM-less agents with the verifier (currently TPM-centric)
   is not yet streamlined; the SPDM evidence flow itself is agent-agnostic.

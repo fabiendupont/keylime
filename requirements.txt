@@ -4,6 +4,9 @@
 # keylime/keylime-rpm keylime/keylime-deb and the keylime ansible installer
 
 cryptography>=3.3.2 # BSD/Apache-2.0
+# cbor2 parses CoRIM/CoMID reference integrity manifests (DMTF CoRIM / RFC 9334)
+# for out-of-band SPDM measurement appraisal
+cbor2>=5.4 # MIT
 tornado>=5.0.2 # Apache-2.0
 pyzmq>=14.4 # LGPL+BSD
 pyyaml>=3.11 # MIT

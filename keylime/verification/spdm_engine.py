@@ -6,6 +6,7 @@ import os
 from typing import TYPE_CHECKING, Any
 
 from keylime import config, keylime_logging
+from keylime.corim import CorimError, appraise_measurements as appraise_against_corim, load_and_verify
 from keylime.failure import Component, Failure
 from keylime.spdm import parse_cert_chain, parse_measurements, verify_cert_chain, verify_signature
 from keylime.verification.base import EngineDriver, VerificationEngine
@@ -97,17 +98,34 @@ class SPDMEngine(VerificationEngine):
             if not item.data.meta.get("spdm_cert_chain"):
                 item.data._add_error("meta", "must contain 'spdm_cert_chain' for spdm_measurements evidence")
 
-    def _load_measurement_policy(self) -> dict[str, str] | None:
-        """Load the reference measurement policy, a JSON file mapping measurement block indexes (as decimal strings)
-        to expected measurement values (as hex strings). If no policy is configured, only the signature, freshness
-        and trust of the evidence are checked."""
+    def _load_reference_policy(self):
+        """Load the reference policy for measurement appraisal.
+
+        In order of preference:
+
+        1. `verifier/spdm_corim` — a signed CoRIM/CoMID manifest (DMTF CoRIM, RATS RFC 9334), verified against
+           the signer certificates in `verifier/spdm_corim_signers`. This is the vendor-manifest appraisal
+           mechanism intended for production.
+        2. `verifier/spdm_measurement_policy` — a simple JSON file mapping measurement block indexes to
+           expected hex values.
+
+        If neither is configured, only the signature, freshness and trust of the evidence are checked.
+        """
+        corim_path = config.get("verifier", "spdm_corim", fallback="")
+
+        if corim_path:
+            signer_dir = config.get(
+                "verifier", "spdm_corim_signers", fallback="/var/lib/keylime/corim_signers"
+            )
+            return ("corim", load_and_verify(corim_path, signer_dir))
+
         path = config.get("verifier", "spdm_measurement_policy", fallback="")
 
         if not path or not os.path.isfile(path):
             return None
 
         with open(path, encoding="utf-8") as f:
-            return json.load(f)
+            return ("json", json.load(f))
 
     def verify_evidence(self) -> None:
         # pylint: disable=protected-access
@@ -173,30 +191,36 @@ class SPDMEngine(VerificationEngine):
             return
 
         # Appraisal: compare measurement blocks against the reference policy, if configured
-        policy = self._load_measurement_policy()
+        policy = self._load_reference_policy()
 
         if policy is not None:
-            for block in blocks:
-                expected = policy.get(str(block.index))
+            policy_kind, reference = policy
 
-                if expected is None:
-                    failure.add_event(
-                        "unexpected_measurement",
-                        {
-                            "message": f"SPDM measurement block {block.index} is not covered by the reference policy",
-                        },
-                        True,
-                    )
-                elif block.value.hex() != expected.removeprefix("0x"):
-                    failure.add_event(
-                        "measurement_mismatch",
-                        {
-                            "message": f"SPDM measurement block {block.index} does not match the reference value",
-                            "expected": expected,
-                            "got": f"0x{block.value.hex()}",
-                        },
-                        True,
-                    )
+            if policy_kind == "corim":
+                for failure_message in appraise_against_corim(blocks, reference):
+                    failure.add_event("measurement_mismatch", {"message": failure_message}, True)
+            else:
+                for block in blocks:
+                    expected = reference.get(str(block.index))
+
+                    if expected is None:
+                        failure.add_event(
+                            "unexpected_measurement",
+                            {
+                                "message": f"SPDM measurement block {block.index} is not covered by the reference policy",
+                            },
+                            True,
+                        )
+                    elif block.value.hex() != expected.removeprefix("0x"):
+                        failure.add_event(
+                            "measurement_mismatch",
+                            {
+                                "message": f"SPDM measurement block {block.index} does not match the reference value",
+                                "expected": expected,
+                                "got": f"0x{block.value.hex()}",
+                            },
+                            True,
+                        )
 
         # Record parsed measurements in the evidence results for auditability
         item.results.meta["measurements"] = [
