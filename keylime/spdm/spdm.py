@@ -172,6 +172,50 @@ def parse_measurements(message: bytes) -> tuple[list[MeasurementBlock], bytes, i
     return blocks, nonce, opaque_length
 
 
+def locate_measurements_message(transcript: bytes) -> int:
+    """Locate the SPDM MEASUREMENTS response within a signed statement.
+
+    SPDM-capable BMCs sign the full L2 measurement transcript — VCA (the version/capabilities/algorithms
+    negotiation) followed by the GET_MEASUREMENTS request and the MEASUREMENTS response. The `SignedMeasurements`
+    blob conveyed by Redfish is that transcript with the signature appended.
+
+    This function scans for the MEASUREMENTS response (the only message with code 0x60 in the transcript)
+    and returns its offset. A bare (transcript-less) response is simply found at offset 0. The located
+    message must end exactly at the end of the buffer: the MEASUREMENTS response is always the last
+    message of the transcript, immediately preceding the signature.
+
+    :raises SpdmError: no well-formed MEASUREMENTS response ending at the buffer end was found
+    """
+    if len(transcript) < 9:
+        raise SpdmError("signed SPDM statement is too short to contain a MEASUREMENTS response")
+
+    for offset in range(0, len(transcript) - 8):
+        # SPDM message header: version(1) code(1) param1(1) param2(1)
+        if transcript[offset + 1] != SPDM_MEASUREMENTS:
+            continue
+
+        # Candidate: validate the internal structure and require an exact fit to the buffer end
+        record_length = struct.unpack_from("<I", transcript, offset + 5)[0]
+        nonce_end = offset + 9 + record_length + SPDM_NONCE_SIZE
+        if nonce_end + 2 > len(transcript):
+            continue
+
+        opaque_length = struct.unpack_from("<H", transcript, nonce_end)[0]
+        message_end = nonce_end + 2 + opaque_length
+
+        if message_end != len(transcript):
+            continue
+
+        # A candidate that structurally fits is the response; validate it fully by parsing
+        try:
+            parse_measurements(transcript[offset:])
+            return offset
+        except SpdmError:
+            continue
+
+    raise SpdmError("could not locate a MEASUREMENTS response ending at the end of the signed statement")
+
+
 def chain_blob_from_pem(pem: str) -> bytes:
     """Convert a PEM certificate chain (concatenated BEGIN/END CERTIFICATE blocks, leaf first), as served by
     Redfish Certificate resources, into the DMTF DSP0274 chain blob format (2-byte total length, then

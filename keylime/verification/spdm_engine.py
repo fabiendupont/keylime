@@ -8,7 +8,13 @@ from typing import TYPE_CHECKING, Any
 from keylime import config, keylime_logging
 from keylime.corim import CorimError, appraise_measurements as appraise_against_corim, load_and_verify
 from keylime.failure import Component, Failure
-from keylime.spdm import parse_cert_chain, parse_measurements, verify_cert_chain, verify_signature
+from keylime.spdm import (
+    locate_measurements_message,
+    parse_cert_chain,
+    parse_measurements,
+    verify_cert_chain,
+    verify_signature,
+)
 from keylime.verification.base import EngineDriver, VerificationEngine
 
 if TYPE_CHECKING:
@@ -170,8 +176,12 @@ class SPDMEngine(VerificationEngine):
             self._process_results(failure)
             return
 
+        # Locate the MEASUREMENTS response within the signed statement. SPDM-capable BMCs sign the full L2
+        # transcript (VCA + GET_MEASUREMENTS request + response); the signature is verified over the whole
+        # statement, while the measurements and nonce are parsed from the located response
         try:
-            blocks, nonce, _opaque_length = parse_measurements(message)
+            response_offset = locate_measurements_message(message)
+            blocks, nonce, _opaque_length = parse_measurements(message[response_offset:])
         except Exception as e:
             failure.add_event(
                 "invalid_measurements", {"message": "SPDM measurements could not be parsed", "error": str(e)}, False

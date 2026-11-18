@@ -18,6 +18,7 @@ from keylime.spdm import (
     MeasurementBlock,
     SpdmError,
     chain_blob_from_pem,
+    locate_measurements_message,
     parse_cert_chain,
     parse_measurements,
     signature_length,
@@ -259,6 +260,35 @@ class TestSignature(unittest.TestCase):
     def test_chain_blob_from_pem_rejects_empty(self):
         with self.assertRaises(SpdmError):
             chain_blob_from_pem("not a pem at all")
+
+    def test_locate_measurements_message_bare_response(self):
+        nonce = b"\x00" * 32
+        message = _make_measurements_message(nonce)
+
+        # A bare (transcript-less) response is located at offset 0
+        self.assertEqual(locate_measurements_message(message), 0)
+
+    def test_locate_measurements_message_in_transcript(self):
+        nonce = b"\x22" * 32
+        response = _make_measurements_message(nonce)
+
+        # L2 transcript: VCA || GET_MEASUREMENTS request || MEASUREMENTS response.
+        # The VCA and request are opaque to the verifier (only included in the signature);
+        # the request carries the nonce, the response is the only 0x60-coded message.
+        vca = bytes.fromhex("12e2000000ff") + b"\x00" * 16
+        request = bytes([0x12, 0xE0, 0x01, 0x00]) + nonce + b"\x00"
+        transcript = vca + request + response
+
+        offset = locate_measurements_message(transcript)
+        self.assertEqual(offset, len(vca) + len(request))
+
+        blocks, parsed_nonce, _ = parse_measurements(transcript[offset:])
+        self.assertEqual(parsed_nonce, nonce)
+        self.assertEqual(len(blocks), 2)
+
+    def test_locate_measurements_message_rejects_garbage(self):
+        with self.assertRaises(SpdmError):
+            locate_measurements_message(b"\x00" * 64)
 
 
 if __name__ == "__main__":
