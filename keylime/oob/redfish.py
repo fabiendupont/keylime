@@ -85,6 +85,15 @@ class RedfishClient:
 
         return resources
 
+    @staticmethod
+    def component_id(component_integrity):
+        """Return the Redfish Id of a ComponentIntegrity resource.
+
+        The schema property is "Id" (capital I); derive it from the URI as a fallback for services
+        that get the casing wrong.
+        """
+        return component_integrity.get("Id") or component_integrity["_uri"].rstrip("/").split("/")[-1]
+
     def get_signed_measurements(self, component_integrity, nonce_hex):
         """Trigger an SPDMGetSignedMeasurements action on a ComponentIntegrity resource.
 

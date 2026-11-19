@@ -407,7 +407,7 @@ class OOBCollector:
                         "meta": {
                             "spdm_cert_chain": cert_chain_b64,
                             "hash_algorithm": hash_algorithm,
-                            "component_id": component["id"],
+                            "component_id": self.bmc.component_id(component),
                         },
                     },
                 }

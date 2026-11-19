@@ -190,6 +190,8 @@ collection_delay_ms = 0
         components = self.client.get_component_integrity()
         self.assertEqual(len(components), 1)
         self.assertEqual(components[0]["ComponentIntegrityType"], "SPDM")
+        # The collector's evidence metadata uses the Redfish Id property ("Id", capital I)
+        self.assertEqual(self.client.component_id(components[0]), "vm1")
 
         measurement = self.client.get_signed_measurements(components[0], nonce.hex())
 
