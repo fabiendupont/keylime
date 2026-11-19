@@ -1,23 +1,25 @@
 """
 Conformance tests for the keylime.spdm parser against the DMTF DSP0274 wire format.
 
-The vectors below are synthetic but structurally faithful:
+The vectors below are synthetic but structurally faithful, and the layout was
+validated against DMTF's own tooling (libspdm reference implementation and the
+spdm-dump parser, into which the real Lenovo GB300 NVL72 / Microchip CEC173x
+capture was fed via a crafted MCTP pcap):
 
-- SPDM 1.0/1.1 strict: 3-byte (uint24) MeasurementRecordLength, message ends at the nonce
-  (no OpaqueDataLength field, per DSP0274 1.0/1.1)
-- SPDM 1.1 de-facto (Microchip CEC173x eRoTs, as found in NVIDIA HGX racks and parsed by
-  NVIDIA's Attestation SDK): 3-byte MeasurementRecordLength plus a 1.2-style OpaqueDataLength
-  field after the nonce — a tolerated deviation from strict 1.1
-- SPDM 1.2/1.3: 4-byte (uint32) MeasurementRecordLength, OpaqueDataLength + OpaqueData
+- MeasurementRecordLength is a 3-byte uint24 in every published DSP0274 version
+  (1.0 through 1.4); libspdm encodes and decodes it as uint24 unconditionally
+- The OpaqueDataLength field follows the nonce in every version
+- SPDM 1.3+ responses carry an 8-byte requester context after the opaque data
 
 Measurement blocks are two-level in every version, per DSP0274:
 
     Index(1) MeasurementSpecification(1) MeasurementSize(2)
     DMTFSpecMeasurementValueType(1) ValueSize(2) Value(var)   [MeasurementSize == 3 + ValueSize]
 
-The CEC173x vector mirrors the shape of a real Lenovo GB300 NVL72 capture (64 blocks, indices
-1..N, ECDSA-P384 signature over request || response in raw r||s form) with synthetic values, so
-that no real device identifiers are committed to the repository.
+The CEC173x vector mirrors the shape of a real Lenovo GB300 NVL72 capture (64
+blocks, indices 1..N, ECDSA-P384 signature over request || response in raw
+r||s form) with synthetic values, so that no real device identifiers are
+committed to the repository.
 """
 
 import struct
@@ -40,6 +42,7 @@ from keylime.spdm import (
 
 SPDM_GET_MEASUREMENTS = 0xE0
 SPDM_MEASUREMENTS = 0x60
+SPDM_REQ_CONTEXT_SIZE = 8
 
 
 def _block(index, value_type, value, spec=0x01):
@@ -48,22 +51,23 @@ def _block(index, value_type, value, spec=0x01):
     return struct.pack("<BBH", index, spec, len(measurement)) + measurement
 
 
-def _response(version, blocks, nonce, opaque=b"", opaque_field=None):
+def _response(version, blocks, nonce, opaque=b"", opaque_field=True):
     """Encode a MEASUREMENTS response (without signature) for the given SPDM version.
 
-    opaque_field defaults to True for SPDM 1.2+ (strict layout) and False for 1.0/1.1
-    (strict layout); pass True for a 1.0/1.1 message to emulate the de-facto CEC173x
-    variant that includes the OpaqueDataLength field anyway.
+    Follows the layout common to all DSP0274 versions: uint24
+    MeasurementRecordLength, nonce, OpaqueDataLength + OpaqueData, and (for
+    SPDM 1.3+) the 8-byte requester context. Pass opaque_field=False to build
+    the non-conformant variant that omits the OpaqueDataLength field (used by
+    negative tests only).
     """
     record = b"".join(_block(b.index, b.value_type, b.value, b.measurement_spec) for b in blocks)
     message = struct.pack("<BBBBB", version, SPDM_MEASUREMENTS, 0x00, 0x00, len(blocks))
-    if version <= 0x11:
-        message += len(record).to_bytes(3, "little")
-    else:
-        message += struct.pack("<I", len(record))
+    message += len(record).to_bytes(3, "little")
     message += record + nonce
-    if opaque_field if opaque_field is not None else version >= 0x12:
+    if opaque_field:
         message += struct.pack("<H", len(opaque)) + opaque
+    if version >= 0x13:
+        message += b"\x00" * SPDM_REQ_CONTEXT_SIZE
     return message
 
 
@@ -85,12 +89,10 @@ RESPONDER_NONCE = bytes(range(32, 64))
 
 
 class TestSpecConformantVectors(unittest.TestCase):
-    """Positive vectors: every supported SPDM version and layout must parse and round-trip."""
+    """Positive vectors: every supported SPDM version must parse and round-trip."""
 
-    def _roundtrip(self, version, opaque_field, opaque=b""):
-        message = _response(
-            version, BLOCKS, RESPONDER_NONCE, opaque=opaque, opaque_field=opaque_field
-        )
+    def _roundtrip(self, version, opaque=b""):
+        message = _response(version, BLOCKS, RESPONDER_NONCE, opaque=opaque)
         blocks, nonce, opaque_length = parse_measurements(message)
 
         self.assertEqual(len(blocks), len(BLOCKS))
@@ -102,27 +104,26 @@ class TestSpecConformantVectors(unittest.TestCase):
         self.assertEqual(nonce, RESPONDER_NONCE)
         self.assertEqual(opaque_length, len(opaque))
 
-    def test_spdm_10_strict(self):
-        self._roundtrip(0x10, opaque_field=False)
+    def test_spdm_10(self):
+        self._roundtrip(0x10)
 
-    def test_spdm_11_strict(self):
-        self._roundtrip(0x11, opaque_field=False)
+    def test_spdm_11_cec173x_layout(self):
+        # The CEC173x (GB300 rack eRoT) wire format: SPDM 1.1, uint24 record
+        # length, OpaqueDataLength present — fully DSP0274-conformant
+        self._roundtrip(0x11)
 
-    def test_spdm_11_cec173x_de_facto(self):
-        # Microchip CEC173x: 1.2-style OpaqueDataLength field present in a 1.1 message
-        self._roundtrip(0x11, opaque_field=True)
-
-    def test_spdm_11_cec173x_with_opaque_data(self):
-        self._roundtrip(0x11, opaque_field=True, opaque=b"\xde\xad\xbe\xef")
+    def test_spdm_11_with_opaque_data(self):
+        self._roundtrip(0x11, opaque=b"\xde\xad\xbe\xef")
 
     def test_spdm_12(self):
-        self._roundtrip(0x12, opaque_field=True)
+        self._roundtrip(0x12)
 
     def test_spdm_12_with_opaque_data(self):
-        self._roundtrip(0x12, opaque_field=True, opaque=b"\x01\x02\x03")
+        self._roundtrip(0x12, opaque=b"\x01\x02\x03")
 
     def test_spdm_13(self):
-        self._roundtrip(0x13, opaque_field=True)
+        # SPDM 1.3 adds the 8-byte requester context after the opaque data
+        self._roundtrip(0x13)
 
     def test_empty_value_block(self):
         # A DMTF measurement with an empty value is legal (MeasurementSize == 3)
@@ -134,8 +135,8 @@ class TestSpecConformantVectors(unittest.TestCase):
 class TestLocateAndRequestNonce(unittest.TestCase):
     """Locating the response in a signed transcript and extracting the request nonce."""
 
-    def _locate(self, version, opaque_field):
-        response = _response(version, BLOCKS, RESPONDER_NONCE, opaque_field=opaque_field)
+    def _locate(self, version):
+        response = _response(version, BLOCKS, RESPONDER_NONCE)
         prefix = b"\x12\xe2\x00\x00\x00\xff" + b"\x00" * 16  # stand-in VCA, opaque to the verifier
         request = _request(version, REQUESTER_NONCE)
         transcript = prefix + request + response
@@ -149,14 +150,14 @@ class TestLocateAndRequestNonce(unittest.TestCase):
 
         self.assertEqual(find_request_nonce(transcript[:offset]), REQUESTER_NONCE)
 
-    def test_locate_spdm_11_strict(self):
-        self._locate(0x11, opaque_field=False)
-
-    def test_locate_spdm_11_cec173x(self):
-        self._locate(0x11, opaque_field=True)
+    def test_locate_spdm_11(self):
+        self._locate(0x11)
 
     def test_locate_spdm_12(self):
-        self._locate(0x12, opaque_field=True)
+        self._locate(0x12)
+
+    def test_locate_spdm_13(self):
+        self._locate(0x13)
 
     def test_locate_bare_response(self):
         response = _response(0x12, BLOCKS, RESPONDER_NONCE)
@@ -266,9 +267,24 @@ class TestMalformedVectors(unittest.TestCase):
 
     def test_rejects_record_length_exceeding_message(self):
         message = bytearray(self._message())
-        struct.pack_into("<I", message, 5, 0xFFFF)
+        message[5:8] = (0xFFFFFF).to_bytes(3, "little")
         with self.assertRaises(SpdmError):
             parse_measurements(bytes(message))
+
+    def test_rejects_uint32_style_record_length(self):
+        # A 4-byte MeasurementRecordLength (a common misreading of DSP0274 1.2)
+        # shifts the nonce by one byte and must be rejected: the field is a
+        # uint24 in every version, per libspdm
+        record = b"".join(_block(b.index, b.value_type, b.value) for b in BLOCKS)
+        message = (
+            struct.pack("<BBBBB", 0x12, SPDM_MEASUREMENTS, 0, 0, len(BLOCKS))
+            + struct.pack("<I", len(record))
+            + record
+            + RESPONDER_NONCE
+            + struct.pack("<H", 0)
+        )
+        with self.assertRaises(SpdmError):
+            parse_measurements(message)
 
     def test_rejects_block_count_mismatch(self):
         message = bytearray(self._message())
@@ -317,19 +333,26 @@ class TestMalformedVectors(unittest.TestCase):
         with self.assertRaises(SpdmError):
             parse_measurements(message)
 
-    def test_rejects_spdm_12_without_opaque_length(self):
-        # SPDM 1.2 requires the OpaqueDataLength field; ending at the nonce is malformed
+    def test_rejects_missing_opaque_length(self):
+        # OpaqueDataLength is part of the MEASUREMENTS layout in every version;
+        # a message ending at the nonce is malformed (rejected by spdm-dump too)
         message = self._message()
         message = message[:-2]
         with self.assertRaises(SpdmError):
             parse_measurements(message)
+
+    def test_rejects_spdm_13_missing_requester_context(self):
+        # SPDM 1.3 responses carry an 8-byte requester context after the opaque data
+        message = _response(0x13, BLOCKS, RESPONDER_NONCE)
+        with self.assertRaises(SpdmError):
+            parse_measurements(message[:-SPDM_REQ_CONTEXT_SIZE])
 
     def test_rejects_trailing_data_after_opaque(self):
         with self.assertRaises(SpdmError):
             parse_measurements(self._message() + b"\x00")
 
     def test_rejects_spdm_11_stray_bytes_after_nonce(self):
-        # Bytes after the nonce that are neither a valid OpaqueDataLength fit nor nothing
+        # A 1.1 message with no well-formed OpaqueDataLength field
         message = _response(0x11, BLOCKS, RESPONDER_NONCE, opaque_field=False)
         with self.assertRaises(SpdmError):
             parse_measurements(message + b"\xff\xff\xff")

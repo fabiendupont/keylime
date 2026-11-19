@@ -61,14 +61,14 @@ def _chain_blob(certs):
     return struct.pack("<H", len(body)) + body
 
 
-def _make_measurements_message(nonce, blocks=None, opaque=b"", version=0x12, opaque_field=None):
+def _make_measurements_message(nonce, blocks=None, opaque=b"", version=0x12):
     """Build a spec-conformant (DSP0274) MEASUREMENTS response.
 
     Measurement blocks use the two-level form Index(1) MeasurementSpecification(1)
-    MeasurementSize(2) wrapping DMTFSpecMeasurementValueType(1) ValueSize(2) Value. The
-    MeasurementRecordLength field is 3 bytes for SPDM 1.0/1.1 and 4 bytes from 1.2 on. By default the
-    OpaqueDataLength field is emitted for SPDM 1.2+ only (strict 1.0/1.1 layout); pass
-    opaque_field=True to emulate the de-facto CEC173x 1.1 variant that includes it anyway.
+    MeasurementSize(2) wrapping DMTFSpecMeasurementValueType(1) ValueSize(2) Value.
+    The MeasurementRecordLength field is a 3-byte uint24 and the OpaqueDataLength
+    field follows the nonce, in every SPDM version (per libspdm, DMTF's reference
+    implementation).
     """
     if blocks is None:
         blocks = [
@@ -82,14 +82,10 @@ def _make_measurements_message(nonce, blocks=None, opaque=b"", version=0x12, opa
         record += struct.pack("<BBH", block.index, block.measurement_spec, len(measurement)) + measurement
 
     message = struct.pack("<BBBBB", version, 0x60, 0x00, 0x00, len(blocks))
-    if version <= 0x11:
-        message += len(record).to_bytes(3, "little")
-    else:
-        message += struct.pack("<I", len(record))
+    message += len(record).to_bytes(3, "little")
     message += record
     message += nonce
-    if opaque_field if opaque_field is not None else version >= 0x12:
-        message += struct.pack("<H", len(opaque)) + opaque
+    message += struct.pack("<H", len(opaque)) + opaque
     return message
 
 

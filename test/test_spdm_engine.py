@@ -54,7 +54,7 @@ def _make_signed_message(device_key, nonce, responder_nonce=None, include_transc
     record = struct.pack("<BBH", block.index, block.measurement_spec, len(measurement)) + measurement
 
     response = struct.pack("<BBBBB", 0x12, 0x60, 0x00, 0x00, 1)
-    response += struct.pack("<I", len(record)) + record
+    response += len(record).to_bytes(3, "little") + record
     response += responder_nonce or nonce
     response += struct.pack("<H", 0)
 
