@@ -125,6 +125,10 @@ class TestSpecConformantVectors(unittest.TestCase):
         # SPDM 1.3 adds the 8-byte requester context after the opaque data
         self._roundtrip(0x13)
 
+    def test_spdm_14(self):
+        # SPDM 1.4 (DSP0274 1.4.1) leaves the MEASUREMENTS layout unchanged from 1.3
+        self._roundtrip(0x14)
+
     def test_empty_value_block(self):
         # A DMTF measurement with an empty value is legal (MeasurementSize == 3)
         message = _response(0x12, [MeasurementBlock(1, 0x01, 0x02, b"")], RESPONDER_NONCE)
