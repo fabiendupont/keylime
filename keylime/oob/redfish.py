@@ -155,6 +155,10 @@ class RedfishClient:
 
         raise RedfishError(f"SPDM measurement task did not complete within {timeout} seconds")
 
+    def get_json(self, path):
+        """GET an arbitrary Redfish resource and return it as a dict (None on no-content)."""
+        return self._json_or_empty(self._request("GET", path))
+
     def get_certificate_chain_pem(self, link):
         """Fetch a Redfish Certificate resource (given as a URI or a `{"@odata.id": ...}` link) and return its
         `CertificateString`: the device's SPDM certificate chain as concatenated PEM."""

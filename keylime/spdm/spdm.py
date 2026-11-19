@@ -33,7 +33,7 @@ from cryptography.hazmat.primitives.asymmetric import ec, padding, rsa
 from cryptography.hazmat.primitives.asymmetric.utils import encode_dss_signature
 from cryptography.x509 import load_der_x509_certificate
 
-from keylime import cert_utils, keylime_logging
+from keylime import keylime_logging
 
 logger = keylime_logging.init_logging("spdm")
 
@@ -89,6 +89,11 @@ def parse_cert_chain(blob: bytes) -> list[x509.Certificate]:
 def verify_cert_chain(certs: list[x509.Certificate], trust_store: str) -> None:
     """Verify each certificate in an SPDM chain is signed by the next, and that the chain roots in the given trust
     store directory. Raises SpdmError on failure."""
+    # Imported lazily: cert_utils pulls pyasn1_modules.rfc4108, which is absent from the system
+    # pyasn1_modules on some distributions (e.g. DGX OS / Ubuntu 22.04), and is not needed by the
+    # OOB tooling until chains are actually verified
+    from keylime import cert_utils  # pylint: disable=import-outside-toplevel
+
     for i, cert in enumerate(certs[:-1]):
         issuer = certs[i + 1]
         if cert.issuer != issuer.subject:
