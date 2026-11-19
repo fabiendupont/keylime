@@ -36,6 +36,8 @@ logger = keylime_logging.init_logging("corim")
 COSE_SIGN1_TAG = 18
 CORIM_TAG = 501
 COMID_TAG = 506
+CORIM_WRAPPER_TAG = 500  # draft-06 era: corim = #6.500(corim-type-choice)
+SIGNED_CORIM_TAG = 502  # draft-06 era: signed-corim wrapper under #6.500
 
 # CoRIM map labels
 RIM_TAGS = 1
@@ -84,27 +86,69 @@ def _digest_hex(digest_entry: Any) -> Optional[str]:
 
 
 def _unwrap_cose(cbor_bytes: bytes) -> bytes:
-    """If the input is a COSE_Sign1 envelope (CBOR tag 18), return its payload; otherwise return the
-    input unchanged, assuming it is already an unwrapped CoRIM payload."""
+    """Unwrap COSE_Sign1 envelopes and legacy wrapper tags, returning the CoRIM payload.
+
+    Handles all forms observed in real vendor manifests:
+    - draft-11: CBOR tag 18 (COSE_Sign1) with a tag-501 payload, or a bare tag-501 payload
+    - draft-06 era (NVIDIA networking, Solidigm): #6.500 wrapping #6.502 wrapping a COSE_Sign1
+    - doubly-signed (NVIDIA ".signed.signed"): the COSE payload carries another layer of wrapper
+      tags and COSE_Sign1 before the final CoRIM map
+
+    Unwrapping repeats until no further COSE envelope or wrapper tag is found.
+    """
     try:
         decoded = cbor2.loads(cbor_bytes)
     except Exception as e:  # pylint: disable=broad-exception-caught
         raise CorimError(f"input is not valid CBOR: {e}") from e
 
-    if isinstance(decoded, cbor2.CBORTag) and decoded.tag == COSE_SIGN1_TAG:
-        _protected, _unprotected, payload, _signature = decoded.value
-        return payload
+    for _ in range(4):  # bound nesting to prevent pathological inputs
+        # Strip legacy wrapper tags: #6.500 -> #6.502
+        while isinstance(decoded, cbor2.CBORTag) and decoded.tag in (CORIM_WRAPPER_TAG, SIGNED_CORIM_TAG):
+            decoded = decoded.value
+            if isinstance(decoded, bytes):
+                decoded = cbor2.loads(decoded)
 
-    return cbor_bytes
+        # Strip a COSE_Sign1 envelope
+        if isinstance(decoded, cbor2.CBORTag) and decoded.tag == COSE_SIGN1_TAG:
+            _protected, _unprotected, payload, _signature = decoded.value
+            decoded = cbor2.loads(payload)
+            continue
+
+        break
+
+    # Re-encode the decoded value so callers always receive bytes
+    if isinstance(decoded, bytes):
+        return decoded
+    return cbor2.dumps(decoded)
 
 
 def _decode_tagged(value: Any, tag: int) -> Any:
     """Decode a CBOR-tagged value, tolerating double encoding (tag wrapping a bstr of the CBOR bytes),
-    which is how CoMIDs appear inside real manifests. Returns the tagged content, decoded."""
-    for _ in range(2):  # tolerate both [tag, content] and [tag, bstr(tagged content)]
+    which is how CoMIDs appear inside real manifests, and legacy draft-06 wrapper tags (#6.500/#6.502)
+    that may appear at any nesting level. Returns the tagged content, decoded."""
+    for _ in range(4):
         if isinstance(value, cbor2.CBORTag):
-            if value.tag != tag:
+            if value.tag == tag:
+                value = value.value
+            elif value.tag in (CORIM_WRAPPER_TAG, SIGNED_CORIM_TAG):
+                value = value.value
+            else:
                 raise CorimError(f"expected CBOR tag {tag}, got {value.tag}")
+        elif isinstance(value, bytes):
+            value = cbor2.loads(value)
+        else:
+            break
+    return value
+
+
+def _decode_comid(tag: Any) -> Any:
+    """Decode a CoRIM tags[] element into a CoMID map. Elements appear as CBOR tag 506 (possibly
+    wrapping a byte string of the CBOR), as bare byte strings (draft-06 era), or as direct maps."""
+    value = tag
+    for _ in range(3):
+        if isinstance(value, cbor2.CBORTag):
+            if value.tag != COMID_TAG:
+                raise CorimError(f"expected CBOR tag {COMID_TAG}, got {value.tag}")
             value = value.value
         elif isinstance(value, bytes):
             value = cbor2.loads(value)
@@ -235,7 +279,7 @@ def parse_corim(cbor_bytes: bytes) -> dict[int, set[str]]:
     measurements: dict[int, set[str]] = {}
 
     for tag in tags:
-        comid = _decode_tagged(tag, COMID_TAG)
+        comid = _decode_comid(tag)
         if not isinstance(comid, dict):
             continue
 
@@ -280,7 +324,7 @@ def parse_corim_devices(cbor_bytes: bytes) -> dict[str, dict[int, set[str]]]:
     devices: dict[str, dict[int, set[str]]] = {}
 
     for tag in tags:
-        comid = _decode_tagged(tag, COMID_TAG)
+        comid = _decode_comid(tag)
         if not isinstance(comid, dict):
             continue
 
@@ -342,10 +386,19 @@ def _cert_signed_by(child: x509.Certificate, issuer: x509.Certificate) -> bool:
 
 
 def _chains_to_anchor(leaf: x509.Certificate, pool: list[x509.Certificate]) -> bool:
-    """Return True when the leaf chains, through certificates in the pool, to a self-signed certificate that is
-    itself part of the pool (the trust anchor). Real vendor CoRIMs are signed by per-product leaves several
-    levels below the root (e.g. NVIDIA's L4 product signers under L1/L2/L3 intermediates), so direct
-    leaf-vs-anchor verification is insufficient."""
+    """Return True when the leaf is trusted via the pool. Trust is established when the leaf chains,
+    through certificates in the pool, to a self-signed certificate in the pool (a root anchor), OR when
+    the leaf itself is part of the pool (a vendor-pinned leaf, e.g. Solidigm publishes their signing
+    certificate directly as the trust anchor). Real vendor CoRIMs are signed by per-product leaves
+    several levels below the root (e.g. NVIDIA's L4 product signers under L1/L2/L3 intermediates), so
+    direct leaf-vs-anchor verification is insufficient."""
+    leaf_der = leaf.public_bytes(Encoding.DER)
+    pool_ders = {c.public_bytes(Encoding.DER) for c in pool}
+
+    # Vendor-pinned leaf: the signer is itself in the trusted pool
+    if leaf_der in pool_ders:
+        return True
+
     anchors = [c for c in pool if c.subject == c.issuer]
     current = leaf
     seen = set()
@@ -373,6 +426,12 @@ def verify_cose_sign1(blob: bytes, trusted_signers: list[x509.Certificate]) -> b
     """
     try:
         envelope = cbor2.loads(blob)
+        # Strip legacy draft-06 wrapper tags (#6.500 -> #6.502) used by NVIDIA networking and
+        # Solidigm manifests before the COSE_Sign1 envelope
+        while isinstance(envelope, cbor2.CBORTag) and envelope.tag in (CORIM_WRAPPER_TAG, SIGNED_CORIM_TAG):
+            envelope = envelope.value
+            if isinstance(envelope, bytes):
+                envelope = cbor2.loads(envelope)
         # COSE_Sign1 is CBOR tag 18; tolerate both the tagged form (as used by real vendor manifests)
         # and the bare 4-element array
         if isinstance(envelope, cbor2.CBORTag):
