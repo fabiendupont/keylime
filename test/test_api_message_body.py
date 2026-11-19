@@ -716,6 +716,13 @@ class TestAPIMessageBodyProperties(unittest.TestCase):
         self.assertIsNotNone(jsonapi)
 
 
+class _FakeController:
+    """Minimal stand-in for Controller exposing only the request method"""
+
+    def __init__(self, request_method):
+        self.request_method = request_method
+
+
 class TestAPIMessageBodyInferHTTPCode(unittest.TestCase):
     """Test cases for APIMessageBody._infer_http_code() and related methods"""
 
@@ -724,7 +731,7 @@ class TestAPIMessageBodyInferHTTPCode(unittest.TestCase):
         message_body = APIMessageBody()
         message_body.add_error(APIError("error", 404))
 
-        code = message_body._infer_http_code()  # pylint: disable=protected-access
+        code = message_body._infer_http_code(_FakeController("POST"))  # pylint: disable=protected-access
 
         self.assertEqual(code, 404)
 
@@ -734,7 +741,7 @@ class TestAPIMessageBodyInferHTTPCode(unittest.TestCase):
         message_body.add_error(APIError("error1", 404))
         message_body.add_error(APIError("error2", 422))
 
-        code = message_body._infer_http_code()  # pylint: disable=protected-access
+        code = message_body._infer_http_code(_FakeController("POST"))  # pylint: disable=protected-access
 
         self.assertEqual(code, 400)
 
@@ -743,7 +750,7 @@ class TestAPIMessageBodyInferHTTPCode(unittest.TestCase):
         message_body = APIMessageBody()
         message_body.add_error(APIError("error", 500))
 
-        code = message_body._infer_http_code()  # pylint: disable=protected-access
+        code = message_body._infer_http_code(_FakeController("POST"))  # pylint: disable=protected-access
 
         self.assertEqual(code, 500)
 
@@ -753,7 +760,7 @@ class TestAPIMessageBodyInferHTTPCode(unittest.TestCase):
         message_body.add_error(APIError("error1", 500))
         message_body.add_error(APIError("error2", 503))
 
-        code = message_body._infer_http_code()  # pylint: disable=protected-access
+        code = message_body._infer_http_code(_FakeController("POST"))  # pylint: disable=protected-access
 
         self.assertEqual(code, 500)
 
@@ -764,7 +771,7 @@ class TestAPIMessageBodyInferHTTPCode(unittest.TestCase):
         message_body.add_error(APIError("error2", 500))
 
         with self.assertRaises(ValueError) as context:
-            message_body._infer_http_code()  # pylint: disable=protected-access
+            message_body._infer_http_code(_FakeController("POST"))  # pylint: disable=protected-access
 
         self.assertIn("both 4xx and 5xx", str(context.exception))
 
@@ -776,7 +783,7 @@ class TestAPIMessageBodyInferHTTPCode(unittest.TestCase):
         message_body.add_error(error)
 
         with self.assertRaises(ValueError) as context:
-            message_body._infer_http_code()  # pylint: disable=protected-access
+            message_body._infer_http_code(_FakeController("POST"))  # pylint: disable=protected-access
 
         self.assertIn("blank http_code", str(context.exception))
 
@@ -785,7 +792,7 @@ class TestAPIMessageBodyInferHTTPCode(unittest.TestCase):
         message_body = APIMessageBody()
         message_body.add_resource(APIResource("agents"))
 
-        code = message_body._infer_http_code()  # pylint: disable=protected-access
+        code = message_body._infer_http_code(_FakeController("POST"))  # pylint: disable=protected-access
 
         self.assertEqual(code, 200)
 
@@ -994,9 +1001,22 @@ class TestAPIMessageBodyInferHTTPCodeWithData(unittest.TestCase):
         message_body.add_resource(resource)
         message_body.include(APILink("self", "/api/agents"))
 
-        code = message_body._infer_http_code()  # pylint: disable=protected-access
+        code = message_body._infer_http_code(_FakeController("POST"))  # pylint: disable=protected-access
 
         self.assertEqual(code, 201)
+
+    def test_infer_http_code_returns_200_for_get_of_new_resource(self):
+        """A GET must never be answered with 201, even when the resource's canonical path
+        differs from the requested one (e.g. the .../attestations/latest alias)"""
+        message_body = APIMessageBody()
+        resource = APIResource("agents", "agent-123")
+        resource.add_link(APILink("self", "/api/agents/agent-123"))
+        message_body.add_resource(resource)
+        message_body.include(APILink("self", "/api/agents"))
+
+        code = message_body._infer_http_code(_FakeController("GET"))  # pylint: disable=protected-access
+
+        self.assertEqual(code, 200)
 
 
 if __name__ == "__main__":
