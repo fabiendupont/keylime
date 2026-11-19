@@ -3,6 +3,7 @@ from keylime.corim.corim import (
     appraise_measurements,
     load_and_verify,
     parse_corim,
+    parse_corim_devices,
     sign_corim,
     verify_cose_sign1,
 )
@@ -14,6 +15,7 @@ __all__ = [
     "inspect",
     "load_and_verify",
     "parse_corim",
+    "parse_corim_devices",
     "sign_corim",
     "verify_cose_sign1",
 ]

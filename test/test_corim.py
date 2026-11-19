@@ -46,19 +46,24 @@ def _make_signer():
 
 
 def _make_corim(digests_by_index):
-    """Build a minimal CoRIM: {tags: [ {measurements: [ {index: {digests: [...]}} ]} ]}."""
-    measurement_maps = [
-        {index: {MEASUREMENT_DIGESTS: [{1: -35, 2: bytes.fromhex(digest)}]}}
-        for index, digest in sorted(digests_by_index.items())
-    ]
-    return {
-        RIM_TAGS: [
-            {
-                2: {0: b"test-tag-identity"},  # tag-identity
-                COMID_MEASUREMENTS: measurement_maps,
-            }
-        ]
+    """Build a CoRIM in the real DMTF wire format (as observed in NVIDIA VR-NVL72 manifests):
+    CBOR tag 501 wrapping {1: [CoMIDs]}, each CoMID being CBOR tag 506 wrapping a byte string of
+    {1: tag-identity, 4: {0: [[m-key, m-val]]}}, with measurements as [m-key, m-val] pairs whose
+    attribute maps carry the index (key 0) and digests (key 1, entries at key 2)."""
+    import cbor2 as _cbor2
+
+    measurement_maps = []
+    for index, digest in sorted(digests_by_index.items()):
+        m_key = {0: {0: b"DEVICE_INFO", 1: "TestVendor", 2: "TestModel", 3: 0}}
+        m_val = [{0: index, 1: {2: [[7, bytes.fromhex(digest)]]}}]
+        measurement_maps.append([m_key, m_val])
+
+    comid = {
+        1: [bytes.fromhex(digests_by_index[min(digests_by_index)])[:0] + b"test-tag-id"],  # tag-identity list
+        4: {0: measurement_maps},
     }
+    corim = {1: [_cbor2.CBORTag(506, _cbor2.dumps(comid))]}
+    return _cbor2.CBORTag(501, corim)
 
 
 class TestCorim(unittest.TestCase):

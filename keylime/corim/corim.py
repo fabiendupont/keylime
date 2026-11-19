@@ -25,20 +25,29 @@ from cryptography import x509
 from cryptography.hazmat.primitives.serialization import Encoding
 from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.asymmetric import ec, padding, rsa
+from cryptography.hazmat.primitives.asymmetric.utils import encode_dss_signature
 from cryptography.x509 import load_pem_x509_certificate
 
 from keylime import keylime_logging
 
 logger = keylime_logging.init_logging("corim")
 
+# CBOR tags (IANA / DMTF CoRIM specification)
+COSE_SIGN1_TAG = 18
+CORIM_TAG = 501
+COMID_TAG = 506
+
 # CoRIM map labels
-RIM_TAGS = 3
+RIM_TAGS = 1
 
 # CoMID map labels
-COMID_MEASUREMENTS = 8
+COMID_TAG_IDENTITY = 1
+COMID_MEASUREMENTS = 4
 
 # Measurement value labels
+MEASUREMENT_INDEX = 0
 MEASUREMENT_DIGESTS = 1
+MEASUREMENT_DIGEST_LIST = 2
 
 # COSE common header parameters and algorithms
 COSE_ALG = 1
@@ -74,12 +83,146 @@ def _digest_hex(digest_entry: Any) -> Optional[str]:
     return None
 
 
-def parse_corim(cbor_bytes: bytes) -> dict[int, set[str]]:
-    """Parse the measurement maps out of a CoRIM (already unwrapped from COSE, if any).
+def _unwrap_cose(cbor_bytes: bytes) -> bytes:
+    """If the input is a COSE_Sign1 envelope (CBOR tag 18), return its payload; otherwise return the
+    input unchanged, assuming it is already an unwrapped CoRIM payload."""
+    try:
+        decoded = cbor2.loads(cbor_bytes)
+    except Exception as e:  # pylint: disable=broad-exception-caught
+        raise CorimError(f"input is not valid CBOR: {e}") from e
 
-    Returns a mapping of measurement index (int) to the set of acceptable digest values
-    (hex strings)."""
-    corim = cbor2.loads(cbor_bytes)
+    if isinstance(decoded, cbor2.CBORTag) and decoded.tag == COSE_SIGN1_TAG:
+        _protected, _unprotected, payload, _signature = decoded.value
+        return payload
+
+    return cbor_bytes
+
+
+def _decode_tagged(value: Any, tag: int) -> Any:
+    """Decode a CBOR-tagged value, tolerating double encoding (tag wrapping a bstr of the CBOR bytes),
+    which is how CoMIDs appear inside real manifests. Returns the tagged content, decoded."""
+    for _ in range(2):  # tolerate both [tag, content] and [tag, bstr(tagged content)]
+        if isinstance(value, cbor2.CBORTag):
+            if value.tag != tag:
+                raise CorimError(f"expected CBOR tag {tag}, got {value.tag}")
+            value = value.value
+        elif isinstance(value, bytes):
+            value = cbor2.loads(value)
+        else:
+            break
+    return value
+
+
+def _normalize_measurement_maps(measurements: Any) -> list:
+    """The CoMID 'measurements' member appears either as a list of measurement maps or as a map keyed by
+    an integer (typically 0) containing that list; normalize to the list."""
+    if isinstance(measurements, dict):
+        for value in measurements.values():
+            if isinstance(value, list):
+                return value
+        raise CorimError("CoMID measurements map does not contain a list of measurement maps")
+    if isinstance(measurements, list):
+        return measurements
+    raise CorimError("CoMID measurements member has an unexpected type")
+
+
+def _measurement_key_components(m_key: Any) -> Optional[dict]:
+    """Extract the device identity components (environment class, vendor, model, instance) from a
+    measurement-map key."""
+    if not isinstance(m_key, dict) or 0 not in m_key:
+        return None
+    env = m_key[0]
+    if not isinstance(env, dict):
+        return None
+    class_id = env.get(0)
+    if isinstance(class_id, cbor2.CBORTag):
+        class_id = class_id.value
+    if isinstance(class_id, bytes):
+        try:
+            class_id = class_id.decode("utf-8", errors="replace")
+        except Exception:  # pylint: disable=broad-exception-caught
+            return None
+    return {
+        "class": class_id,
+        "vendor": env.get(1),
+        "model": env.get(2),
+        "instance": env.get(3),
+    }
+
+
+def _measurement_digests(m_val: Any) -> list[str]:
+    """Extract the digest values (hex strings) from a measurement-map value. The value is a list of attribute
+    maps; digest attributes are keyed MEASUREMENT_DIGESTS and hold either a versioned digest container
+    ({0: version, 2: entries}) or an algorithm-tagged one ({1: cose-alg, 2: entries}), where each entry is a
+    2-element array whose final element is the digest bytes."""
+    digests: list[str] = []
+
+    if not isinstance(m_val, list):
+        return digests
+
+    for attrs in m_val:
+        if not isinstance(attrs, dict):
+            continue
+
+        digest_container = attrs.get(MEASUREMENT_DIGESTS)
+        if not isinstance(digest_container, dict):
+            continue
+
+        entries = digest_container.get(MEASUREMENT_DIGEST_LIST)
+        if not isinstance(entries, list):
+            continue
+
+        for entry in entries:
+            digest = _digest_hex(entry)
+            if digest:
+                digests.append(digest)
+
+    return digests
+
+
+def _indexed_digests(m_val: Any) -> list[tuple[int, list[str]]]:
+    """Extract (measurement index, digests) pairs from a measurement-map value.
+
+    The value is a list of attribute maps. Index and digests may appear in the same attribute map
+    ({index: ..., digests: ...}, as in the NVIDIA CEC1736 measurements) or in adjacent maps (an index
+    attribute followed by a digest attribute, as in the MCXN556 measurements); both forms are handled
+    by tracking the most recent index seen.
+    """
+    results: list[tuple[int, list[str]]] = []
+    current_index: Optional[int] = None
+
+    if not isinstance(m_val, list):
+        return results
+
+    for attrs in m_val:
+        if not isinstance(attrs, dict):
+            continue
+
+        index = attrs.get(MEASUREMENT_INDEX)
+        if isinstance(index, int):
+            current_index = index
+
+        digest_container = attrs.get(MEASUREMENT_DIGESTS)
+        if isinstance(digest_container, dict):
+            entries = digest_container.get(MEASUREMENT_DIGEST_LIST)
+            if isinstance(entries, list):
+                digests = [d for d in (_digest_hex(e) for e in entries) if d]
+                if digests and current_index is not None:
+                    results.append((current_index, digests))
+
+    return results
+
+
+def parse_corim(cbor_bytes: bytes) -> dict[int, set[str]]:
+    """Parse the measurement maps out of a CoRIM payload (already unwrapped from COSE, if any).
+
+    Returns a mapping of measurement index (int) to the set of acceptable digest values (hex strings).
+    Follows the DMTF CoRIM wire format as observed in real vendor manifests (NVIDIA VR-NVL72): a CBOR
+    tag 501 wrapping a map with 'tags' (label 1) containing CoMIDs (CBOR tag 506, possibly double
+    encoded as a byte string), each CoMID carrying 'measurements' (label 4). A COSE_Sign1-wrapped
+    input (CBOR tag 18) is unwrapped automatically.
+    """
+    corim = _decode_tagged(_unwrap_cose(cbor_bytes), CORIM_TAG)
 
     if not isinstance(corim, dict):
         raise CorimError("CoRIM is not a CBOR map")
@@ -92,34 +235,24 @@ def parse_corim(cbor_bytes: bytes) -> dict[int, set[str]]:
     measurements: dict[int, set[str]] = {}
 
     for tag in tags:
-        if not isinstance(tag, dict):
+        comid = _decode_tagged(tag, COMID_TAG)
+        if not isinstance(comid, dict):
             continue
 
-        measurement_maps = tag.get(COMID_MEASUREMENTS)
-
-        if not isinstance(measurement_maps, list):
-            continue
+        measurement_maps = _normalize_measurement_maps(comid.get(COMID_MEASUREMENTS))
 
         for measurement_map in measurement_maps:
-            if not isinstance(measurement_map, dict):
+            # Measurement maps appear either as [m-key, m-val] arrays or as {m-key: m-val} dicts
+            if isinstance(measurement_map, dict):
+                pairs = measurement_map.items()
+            elif isinstance(measurement_map, list) and len(measurement_map) == 2:
+                pairs = [(measurement_map[0], measurement_map[1])]
+            else:
                 continue
 
-            for key, value in measurement_map.items():
-                if not isinstance(value, dict):
-                    continue
-
-                digests = value.get(MEASUREMENT_DIGESTS)
-                if not isinstance(digests, list):
-                    continue
-
-                acceptable = set()
-                for entry in digests:
-                    digest = _digest_hex(entry)
-                    if digest:
-                        acceptable.add(digest)
-
-                if acceptable and isinstance(key, int):
-                    measurements.setdefault(key, set()).update(acceptable)
+            for _m_key, m_val in pairs:
+                for index, digests in _indexed_digests(m_val):
+                    measurements.setdefault(index, set()).update(digests)
 
     if not measurements:
         raise CorimError("CoRIM contains no usable CoMID measurement maps")
@@ -127,22 +260,108 @@ def parse_corim(cbor_bytes: bytes) -> dict[int, set[str]]:
     return measurements
 
 
-def _load_certs_from_dir(trust_dir: str) -> list[x509.Certificate]:
-    certs = []
+def parse_corim_devices(cbor_bytes: bytes) -> dict[str, dict[int, set[str]]]:
+    """Parse a CoRIM payload into per-device measurement references.
 
-    if not os.path.isdir(trust_dir):
-        raise CorimError(f"CoRIM signer trust store '{trust_dir}' is not a directory")
+    Returns a mapping of device identity ("vendor/model[instance]") to a mapping of measurement index to
+    the set of acceptable digests. This is the reference structure needed for multi-component appraisal,
+    where SPDM measurement indices collide across devices (every eRoT has indices 1..N). A
+    COSE_Sign1-wrapped input (CBOR tag 18) is unwrapped automatically.
+    """
+    corim = _decode_tagged(_unwrap_cose(cbor_bytes), CORIM_TAG)
 
-    for name in sorted(os.listdir(trust_dir)):
-        if not name.endswith(".pem") and not name.endswith(".crt") and not name.endswith(".cer"):
+    if not isinstance(corim, dict):
+        raise CorimError("CoRIM is not a CBOR map")
+
+    tags = corim.get(RIM_TAGS)
+    if not isinstance(tags, list):
+        raise CorimError("CoRIM does not contain a 'tags' member with CoMIDs")
+
+    devices: dict[str, dict[int, set[str]]] = {}
+
+    for tag in tags:
+        comid = _decode_tagged(tag, COMID_TAG)
+        if not isinstance(comid, dict):
             continue
-        with open(os.path.join(trust_dir, name), "rb") as f:
-            certs.append(load_pem_x509_certificate(f.read()))
 
-    if not certs:
-        raise CorimError(f"CoRIM signer trust store '{trust_dir}' contains no certificates")
+        measurement_maps = _normalize_measurement_maps(comid.get(COMID_MEASUREMENTS))
 
-    return certs
+        for measurement_map in measurement_maps:
+            if isinstance(measurement_map, dict):
+                pairs = measurement_map.items()
+            elif isinstance(measurement_map, list) and len(measurement_map) == 2:
+                pairs = [(measurement_map[0], measurement_map[1])]
+            else:
+                continue
+
+            for m_key, m_val in pairs:
+                identity = _measurement_key_components(m_key)
+                if identity is None:
+                    continue
+
+                device = f"{identity['vendor']}/{identity['model']}[{identity['instance']}]"
+
+                for index, digests in _indexed_digests(m_val):
+                    devices.setdefault(device, {}).setdefault(index, set()).update(digests)
+
+    if not devices:
+        raise CorimError("CoRIM contains no usable device measurement maps")
+
+    return devices
+
+
+def _cose_ecdsa_signature(signature: bytes, curve_bits: int) -> bytes:
+    """Convert a COSE raw r||s ECDSA signature (per RFC 9052) to the DER encoding expected by
+    python-cryptography."""
+    coordinate_size = (curve_bits + 7) // 8
+    raw_size = 2 * coordinate_size
+
+    if len(signature) == raw_size:
+        r = int.from_bytes(signature[:coordinate_size], "big")
+        s = int.from_bytes(signature[coordinate_size:], "big")
+        return encode_dss_signature(r, s)
+
+    return signature
+
+
+def _cert_signed_by(child: x509.Certificate, issuer: x509.Certificate) -> bool:
+    """Return True when child's signature verifies under issuer's public key."""
+    public_key = issuer.public_key()
+    try:
+        if isinstance(public_key, ec.EllipticCurvePublicKey):
+            public_key.verify(child.signature, child.tbs_certificate_bytes, ec.ECDSA(child.signature_hash_algorithm))
+        elif isinstance(public_key, rsa.RSAPublicKey):
+            public_key.verify(
+                child.signature, child.tbs_certificate_bytes, padding.PKCS1v15(), child.signature_hash_algorithm
+            )
+        else:
+            return False
+        return True
+    except Exception:  # pylint: disable=broad-exception-caught
+        return False
+
+
+def _chains_to_anchor(leaf: x509.Certificate, pool: list[x509.Certificate]) -> bool:
+    """Return True when the leaf chains, through certificates in the pool, to a self-signed certificate that is
+    itself part of the pool (the trust anchor). Real vendor CoRIMs are signed by per-product leaves several
+    levels below the root (e.g. NVIDIA's L4 product signers under L1/L2/L3 intermediates), so direct
+    leaf-vs-anchor verification is insufficient."""
+    anchors = [c for c in pool if c.subject == c.issuer]
+    current = leaf
+    seen = set()
+
+    while True:
+        if current.public_bytes(Encoding.DER) in seen:
+            return False
+        seen.add(current.public_bytes(Encoding.DER))
+
+        if any(current.public_bytes(Encoding.DER) == a.public_bytes(Encoding.DER) for a in anchors):
+            return True
+
+        issuer = next((c for c in pool if c.subject == current.issuer and _cert_signed_by(current, c)), None)
+        if issuer is None:
+            return False
+        current = issuer
 
 
 def verify_cose_sign1(blob: bytes, trusted_signers: list[x509.Certificate]) -> bytes:
@@ -153,7 +372,16 @@ def verify_cose_sign1(blob: bytes, trusted_signers: list[x509.Certificate]) -> b
     (each trusted signer is tried against the signature).
     """
     try:
-        protected, _unprotected, payload, signature = cbor2.loads(blob)
+        envelope = cbor2.loads(blob)
+        # COSE_Sign1 is CBOR tag 18; tolerate both the tagged form (as used by real vendor manifests)
+        # and the bare 4-element array
+        if isinstance(envelope, cbor2.CBORTag):
+            if envelope.tag != COSE_SIGN1_TAG:
+                raise CorimError(f"expected COSE_Sign1 (CBOR tag 18), got tag {envelope.tag}")
+            envelope = envelope.value
+        protected, _unprotected, payload, signature = envelope
+    except CorimError:
+        raise
     except Exception as e:
         raise CorimError(f"blob is not a well-formed COSE_Sign1 structure: {e}") from e
 
@@ -203,16 +431,41 @@ def verify_cose_sign1(blob: bytes, trusted_signers: list[x509.Certificate]) -> b
         public_key = cert.public_key()
         try:
             if isinstance(public_key, ec.EllipticCurvePublicKey):
-                public_key.verify(signature, sig_structure, ec.ECDSA(hash_alg()))
+                der_sig = _cose_ecdsa_signature(signature, public_key.curve.key_size)
+                public_key.verify(der_sig, sig_structure, ec.ECDSA(hash_alg()))
             elif isinstance(public_key, rsa.RSAPublicKey):
                 public_key.verify(signature, sig_structure, padding.PKCS1v15(), hash_alg())
             else:
                 continue
-            return payload
         except Exception as e:  # pylint: disable=broad-exception-caught
             last_error = e
+            continue
+
+        # The signature verifies under this certificate's key; it is only trusted if the certificate
+        # chains to a self-signed anchor in the trusted pool
+        if _chains_to_anchor(cert, trusted_signers):
+            return payload
+        last_error = CorimError(f"signer '{cert.subject.rfc4514_string()}' does not chain to a trust anchor")
 
     raise CorimError(f"CoRIM signature does not verify against any trusted signer ({last_error})")
+
+
+def _load_certs_from_dir(trust_dir: str) -> list[x509.Certificate]:
+    certs = []
+
+    if not os.path.isdir(trust_dir):
+        raise CorimError(f"CoRIM signer trust store '{trust_dir}' is not a directory")
+
+    for name in sorted(os.listdir(trust_dir)):
+        if not name.endswith(".pem") and not name.endswith(".crt") and not name.endswith(".cer"):
+            continue
+        with open(os.path.join(trust_dir, name), "rb") as f:
+            certs.append(load_pem_x509_certificate(f.read()))
+
+    if not certs:
+        raise CorimError(f"CoRIM signer trust store '{trust_dir}' contains no certificates")
+
+    return certs
 
 
 def load_and_verify(path: str, trust_dir: str) -> dict[int, set[str]]:

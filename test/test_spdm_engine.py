@@ -168,8 +168,12 @@ class TestSPDMEngine(unittest.TestCase):
         signer_key = ec.generate_private_key(ec.SECP384R1())
         signer_cert = _make_cert(signer_key, cn="corim-signer")
 
-        # CoMID measurement map declaring the digest of the signed measurement block (index 1, 0xaa * 48)
-        corim = {3: [{2: {0: b"test-tag"}, 8: [{1: {1: [{1: -35, 2: b"\xaa" * 48}]}}]}]}
+        # CoRIM in the real DMTF wire format, declaring the digest of measurement block 1 (0xaa * 48)
+        import cbor2 as _cbor2
+        m_key = {0: {0: b"DEVICE_INFO", 1: "TestVendor", 2: "TestModel", 3: 0}}
+        m_val = [{0: 1, 1: {2: [[7, b"\xaa" * 48]]}}]
+        comid = {1: [b"test-tag-id"], 4: {0: [[m_key, m_val]]}}
+        corim = _cbor2.CBORTag(501, {1: [_cbor2.CBORTag(506, _cbor2.dumps(comid))]})
         blob = sign_corim(corim, signer_key)
 
         corim_file = tempfile.NamedTemporaryFile(suffix=".corim", delete=False)  # pylint: disable=consider-using-with
@@ -207,7 +211,11 @@ class TestSPDMEngine(unittest.TestCase):
         signer_cert = _make_cert(signer_key, cn="corim-signer")
 
         # Manifest declares a digest that does NOT match the signed measurement block
-        corim = {3: [{2: {0: b"test-tag"}, 8: [{1: {1: [{1: -35, 2: b"\xcc" * 48}]}}]}]}
+        import cbor2 as _cbor2
+        m_key = {0: {0: b"DEVICE_INFO", 1: "TestVendor", 2: "TestModel", 3: 0}}
+        m_val = [{0: 1, 1: {2: [[7, b"\xcc" * 48]]}}]
+        comid = {1: [b"test-tag-id"], 4: {0: [[m_key, m_val]]}}
+        corim = _cbor2.CBORTag(501, {1: [_cbor2.CBORTag(506, _cbor2.dumps(comid))]})
         blob = sign_corim(corim, signer_key)
 
         corim_file = tempfile.NamedTemporaryFile(suffix=".corim", delete=False)  # pylint: disable=consider-using-with

@@ -111,10 +111,15 @@ def inspect(path: str, signers_dir: str | None = None) -> int:
 
     print(f"== {path} ({len(blob)} bytes) ==")
 
-    # Try COSE_Sign1 first
+    # Try COSE_Sign1 first (bare array or CBOR tag 18, as used by real vendor manifests)
     payload = None
     try:
-        protected, unprotected, cose_payload, signature = cbor2.loads(blob)
+        decoded = cbor2.loads(blob)
+        if isinstance(decoded, cbor2.CBORTag):
+            if decoded.tag != 18:
+                raise ValueError(f"CBOR tag {decoded.tag}")
+            decoded = decoded.value
+        protected, unprotected, cose_payload, signature = decoded
         if isinstance(protected, bytes) and isinstance(cose_payload, bytes):
             print("Envelope: COSE_Sign1")
             headers = cbor2.loads(protected)
@@ -149,13 +154,14 @@ def inspect(path: str, signers_dir: str | None = None) -> int:
         return 1
 
     print("\n== keylime subset compatibility ==")
-    from keylime.corim import parse_corim
+    from keylime.corim import parse_corim, parse_corim_devices
 
     try:
-        measurements = parse_corim(payload)
-        print(f"  parse_corim: OK — {len(measurements)} measurement index(es): {sorted(measurements.keys())}")
-        for index, digests in sorted(measurements.items()):
-            print(f"    index {index}: {len(digests)} digest(s), {min(len(d) for d in digests) * 4}-bit")
+        devices = parse_corim_devices(payload)
+        total = sum(len(m) for m in devices.values())
+        print(f"  parse_corim_devices: OK — {len(devices)} device(s), {total} indexed measurement(s)")
+        for dev, meas in sorted(devices.items()):
+            print(f"    {dev}: indices {sorted(meas.keys())}")
         print("  appraiseable: yes")
         return 0
     except Exception as e:  # pylint: disable=broad-exception-caught
