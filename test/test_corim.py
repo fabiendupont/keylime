@@ -90,7 +90,9 @@ class TestCorim(unittest.TestCase):
 
     def test_parse_and_appraise_pass(self):
         path = self._write_signed_corim()
-        reference = load_and_verify(path, self.trust_dir.name)
+        payload = load_and_verify(path, self.trust_dir.name)
+        from keylime.corim import parse_corim
+        reference = parse_corim(payload)
 
         self.assertEqual(set(reference.keys()), {1, 2})
         self.assertEqual(reference[1], {self.digests[1]})
@@ -98,7 +100,9 @@ class TestCorim(unittest.TestCase):
 
     def test_appraise_detects_mismatch(self):
         path = self._write_signed_corim(digests={1: "aa" * 48, 2: "cc" * 48})  # block 2 differs
-        reference = load_and_verify(path, self.trust_dir.name)
+        payload = load_and_verify(path, self.trust_dir.name)
+        from keylime.corim import parse_corim
+        reference = parse_corim(payload)
 
         failures = appraise_measurements(self.blocks, reference)
         self.assertEqual(len(failures), 1)
@@ -106,7 +110,9 @@ class TestCorim(unittest.TestCase):
 
     def test_appraise_detects_uncovered_block(self):
         path = self._write_signed_corim(digests={1: "aa" * 48})  # manifest only covers block 1
-        reference = load_and_verify(path, self.trust_dir.name)
+        payload = load_and_verify(path, self.trust_dir.name)
+        from keylime.corim import parse_corim
+        reference = parse_corim(payload)
 
         failures = appraise_measurements(self.blocks, reference)
         self.assertEqual(len(failures), 1)

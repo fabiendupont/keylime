@@ -96,10 +96,14 @@ def _unwrap_cose(cbor_bytes: bytes) -> bytes:
 
     Unwrapping repeats until no further COSE envelope or wrapper tag is found.
     """
-    try:
-        decoded = cbor2.loads(cbor_bytes)
-    except Exception as e:  # pylint: disable=broad-exception-caught
-        raise CorimError(f"input is not valid CBOR: {e}") from e
+    if isinstance(cbor_bytes, bytes):
+        try:
+            decoded = cbor2.loads(cbor_bytes)
+        except Exception as e:  # pylint: disable=broad-exception-caught
+            raise CorimError(f"input is not valid CBOR: {e}") from e
+    else:
+        # Already-decoded CBOR value (e.g. from sign_corim in tests)
+        decoded = cbor_bytes
 
     for _ in range(4):  # bound nesting to prevent pathological inputs
         # Strip legacy wrapper tags: #6.500 -> #6.502
@@ -527,8 +531,12 @@ def _load_certs_from_dir(trust_dir: str) -> list[x509.Certificate]:
     return certs
 
 
-def load_and_verify(path: str, trust_dir: str) -> dict[int, set[str]]:
-    """Load, verify and parse a CoRIM file (COSE_Sign1-wrapped or plain CBOR).
+def load_and_verify(path: str, trust_dir: str) -> bytes:
+    """Load and verify a CoRIM file (COSE_Sign1-wrapped or plain CBOR).
+
+    Returns the verified CoRIM payload bytes; callers parse it into the reference
+    structure they need (parse_corim for flat index references, parse_corim_devices
+    for per-device references).
 
     Plain (unsigned) CoRIMs are only accepted for testing and log a loud warning; set
     allow_unsigned on the appraisal call site only in test code."""
@@ -546,7 +554,7 @@ def load_and_verify(path: str, trust_dir: str) -> dict[int, set[str]]:
         else:
             raise CorimError(f"CoRIM '{path}' could not be verified: {e}") from e
 
-    return parse_corim(payload)
+    return payload
 
 
 def _looks_like_plain_corim(blob: bytes) -> bool:

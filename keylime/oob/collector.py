@@ -404,7 +404,11 @@ class OOBCollector:
                     "data": {
                         "message": base64.b64encode(message).decode("utf-8"),
                         "signature": base64.b64encode(signature).decode("utf-8"),
-                        "meta": {"spdm_cert_chain": cert_chain_b64, "hash_algorithm": hash_algorithm},
+                        "meta": {
+                            "spdm_cert_chain": cert_chain_b64,
+                            "hash_algorithm": hash_algorithm,
+                            "component_id": component["id"],
+                        },
                     },
                 }
             )

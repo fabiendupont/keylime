@@ -3,10 +3,16 @@
 import base64
 import json
 import os
+from typing import Optional
 from typing import TYPE_CHECKING, Any
 
 from keylime import config, keylime_logging
-from keylime.corim import CorimError, appraise_measurements as appraise_against_corim, load_and_verify
+from keylime.corim import (
+    CorimError,
+    appraise_measurements as appraise_against_corim,
+    load_and_verify,
+    parse_corim_devices,
+)
 from keylime.failure import Component, Failure
 from keylime.spdm import (
     locate_measurements_message,
@@ -111,7 +117,9 @@ class SPDMEngine(VerificationEngine):
 
         1. `verifier/spdm_corim` — a signed CoRIM/CoMID manifest (DMTF CoRIM, RATS RFC 9334), verified against
            the signer certificates in `verifier/spdm_corim_signers`. This is the vendor-manifest appraisal
-           mechanism intended for production.
+           mechanism intended for production. Per-device references are extracted so that SPDM measurement
+           indices (which collide across devices — every eRoT has indices 1..N) are matched against the
+           correct device's digests.
         2. `verifier/spdm_measurement_policy` — a simple JSON file mapping measurement block indexes to
            expected hex values.
 
@@ -123,7 +131,8 @@ class SPDMEngine(VerificationEngine):
             signer_dir = config.get(
                 "verifier", "spdm_corim_signers", fallback="/var/lib/keylime/corim_signers"
             )
-            return ("corim", load_and_verify(corim_path, signer_dir))
+            devices = parse_corim_devices(load_and_verify(corim_path, signer_dir))
+            return ("corim", devices)
 
         path = config.get("verifier", "spdm_measurement_policy", fallback="")
 
@@ -132,6 +141,36 @@ class SPDMEngine(VerificationEngine):
 
         with open(path, encoding="utf-8") as f:
             return ("json", json.load(f))
+
+    @staticmethod
+    def _match_corim_device(devices: dict, device_hint: str) -> Optional[str]:
+        """Match a ComponentIntegrity identity hint against CoRIM device names.
+
+        CoRIM devices are identified as 'vendor/model[instance]' (e.g. 'NVIDIA/CEC1736 ERoT[1]'), while the
+        collector knows the Redfish ComponentIntegrity ID (e.g. 'HGX_ERoT_BMC_0'). The matching is
+        substring-based: a CoRIM device matches when its model name appears in the hint (case-insensitive),
+        covering the common pattern where the ComponentIntegrity ID embeds the device model.
+        """
+        if not device_hint:
+            return None
+
+        hint_lower = device_hint.lower()
+
+        # Exact match first
+        if device_hint in devices:
+            return device_hint
+
+        # Substring match: CoRIM model name appears in the ComponentIntegrity ID
+        for device_name in devices:
+            # Extract the model part (between '/' and '[')
+            parts = device_name.split("/")
+            if len(parts) < 2:
+                continue
+            model = parts[1].split("[")[0].strip()
+            if model and model.lower() in hint_lower:
+                return device_name
+
+        return None
 
     def verify_evidence(self) -> None:
         # pylint: disable=protected-access
@@ -207,8 +246,40 @@ class SPDMEngine(VerificationEngine):
             policy_kind, reference = policy
 
             if policy_kind == "corim":
-                for failure_message in appraise_against_corim(blocks, reference):
-                    failure.add_event("measurement_mismatch", {"message": failure_message}, True)
+                # reference is a per-device mapping: {device_name: {index: {digest_hex, ...}}}
+                # Determine which device's reference to use from the evidence metadata
+                device_hint = item.data.meta.get("spdm_device") or item.data.meta.get("component_id", "")
+                matched_device = self._match_corim_device(reference, device_hint)
+
+                if matched_device:
+                    device_ref = reference[matched_device]
+                    logger.info(
+                        "Appraising SPDM measurements for agent '%s' against CoRIM device '%s' "
+                        "(%d indexed reference values)",
+                        self.agent_id,
+                        matched_device,
+                        len(device_ref),
+                    )
+                    for failure_message in appraise_against_corim(blocks, device_ref):
+                        failure.add_event("measurement_mismatch", {"message": failure_message}, True)
+                else:
+                    # No device match: appraise against all devices' references (any match passes)
+                    # This handles the single-component case where device identification is not yet wired
+                    all_failures = []
+                    for device_name, device_ref in reference.items():
+                        device_failures = appraise_against_corim(blocks, device_ref)
+                        if not device_failures:
+                            logger.info(
+                                "SPDM measurements for agent '%s' match CoRIM device '%s'",
+                                self.agent_id,
+                                device_name,
+                            )
+                            all_failures = []
+                            break
+                        all_failures = device_failures
+
+                    for failure_message in all_failures:
+                        failure.add_event("measurement_mismatch", {"message": failure_message}, True)
             else:
                 for block in blocks:
                     expected = reference.get(str(block.index))
