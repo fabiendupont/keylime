@@ -193,7 +193,7 @@ class AttestationController(Controller):
             APIError("not_found", f"No attestation {index} exists for agent '{agent_id}'.").send_via(self)
 
         APIResource("attestation", attestation.render_state()).include(  # type: ignore[no-untyped-call, union-attr]
-            APILink("self", f"/{self.version}/agents/{agent_id}/attestations/{index}")
+            APILink("self", f"/v{self.major_version}/agents/{agent_id}/attestations/{index}")
         ).send_via(
             self
         )  # type: ignore[no-untyped-call]

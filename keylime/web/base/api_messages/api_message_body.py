@@ -286,11 +286,14 @@ class APIMessageBody(APILinksMixin, APIMetaMixin):
 
         return code  # type: ignore[return-value]
 
-    def _infer_http_code(self) -> int:
+    def _infer_http_code(self, controller: "Controller") -> int:
         if self.errors:
             return self._infer_http_error_code()
 
-        return 201 if self._is_resource_new() else 200
+        # 201 (Created) is only appropriate for POST requests; GET/PUT/PATCH of an existing
+        # resource — including via an alias such as .../attestations/latest, whose canonical
+        # resource path differs from the requested one — must be answered with 200
+        return 201 if (controller.request_method == "POST" and self._is_resource_new()) else 200
 
     def _log_errors(self) -> None:
         if not self.errors:
@@ -319,7 +322,7 @@ class APIMessageBody(APILinksMixin, APIMetaMixin):
                 controller.set_header("Location", resource_path)
 
         if not code:
-            code = self._infer_http_code()
+            code = self._infer_http_code(controller)
 
         self._log_errors()
         controller.send_response(code, status, self.render(), "application/vnd.api+json")
