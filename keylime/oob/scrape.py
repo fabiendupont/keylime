@@ -53,9 +53,11 @@ logger = keylime_logging.init_logging("oob_scrape")
 
 
 class BmcScraper:
-    def __init__(self, host, outdir, challenge=True, timeout=30, insecure=False, ca_cert=""):
+    def __init__(self, host, outdir, challenge=True, timeout=30, insecure=False, ca_cert="", components=None):
         self.host = host
         self.challenge = challenge
+        # Optional allowlist of ComponentIntegrity IDs to capture (default: all)
+        self.component_filter = set(components) if components else None
         self.client = RedfishClient(
             host, config.get("oob", "bmc_username", fallback="root"), "", verify_tls=(ca_cert or not insecure),
             timeout=timeout,
@@ -129,6 +131,9 @@ class BmcScraper:
                 continue
 
             component = {"uri": uri, "id": uri.rstrip("/").split("/")[-1]}
+
+            if self.component_filter and component["id"] not in self.component_filter:
+                continue
 
             try:
                 components.append(self._scrape_component(component))
@@ -267,6 +272,12 @@ def main():
         action="store_true",
         help="passive scrape only: no SPDMGetSignedMeasurements requests (Phase 1 discovery)",
     )
+    parser.add_argument(
+        "--component",
+        action="append",
+        help="restrict capture to the given ComponentIntegrity ID (repeatable; default: all). Use for the "
+        "first active challenge of a component before sweeping the full rack.",
+    )
     parser.add_argument("--timeout", type=int, default=30)
     args = parser.parse_args()
 
@@ -289,6 +300,7 @@ def main():
             timeout=args.timeout,
             insecure=args.insecure,
             ca_cert=args.bmc_ca_cert,
+            components=args.component,
         )
         scraper.client.session.auth = (args.bmc_user, args.bmc_password)
         try:
