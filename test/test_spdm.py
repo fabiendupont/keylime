@@ -61,22 +61,35 @@ def _chain_blob(certs):
     return struct.pack("<H", len(body)) + body
 
 
-def _make_measurements_message(nonce, blocks=None, opaque=b""):
+def _make_measurements_message(nonce, blocks=None, opaque=b"", version=0x12, opaque_field=None):
+    """Build a spec-conformant (DSP0274) MEASUREMENTS response.
+
+    Measurement blocks use the two-level form Index(1) MeasurementSpecification(1)
+    MeasurementSize(2) wrapping DMTFSpecMeasurementValueType(1) ValueSize(2) Value. The
+    MeasurementRecordLength field is 3 bytes for SPDM 1.0/1.1 and 4 bytes from 1.2 on. By default the
+    OpaqueDataLength field is emitted for SPDM 1.2+ only (strict 1.0/1.1 layout); pass
+    opaque_field=True to emulate the de-facto CEC173x 1.1 variant that includes it anyway.
+    """
     if blocks is None:
         blocks = [
-            MeasurementBlock(index=1, measurement_spec=0x01, dmtf_spec=0x01, value_type=0x02, value=b"\xaa" * 48),
-            MeasurementBlock(index=2, measurement_spec=0x01, dmtf_spec=0x01, value_type=0x03, value=b"\xbb" * 48),
+            MeasurementBlock(index=1, measurement_spec=0x01, value_type=0x02, value=b"\xaa" * 48),
+            MeasurementBlock(index=2, measurement_spec=0x01, value_type=0x03, value=b"\xbb" * 48),
         ]
 
     record = b""
     for block in blocks:
-        record += struct.pack("<BBBBH", block.index, block.measurement_spec, block.dmtf_spec, block.value_type, len(block.value))
-        record += block.value
+        measurement = struct.pack("<BH", block.value_type, len(block.value)) + block.value
+        record += struct.pack("<BBH", block.index, block.measurement_spec, len(measurement)) + measurement
 
-    message = struct.pack("<BBBBB", 0x12, 0x60, 0x00, 0x00, len(blocks))
-    message += struct.pack("<I", len(record)) + record
+    message = struct.pack("<BBBBB", version, 0x60, 0x00, 0x00, len(blocks))
+    if version <= 0x11:
+        message += len(record).to_bytes(3, "little")
+    else:
+        message += struct.pack("<I", len(record))
+    message += record
     message += nonce
-    message += struct.pack("<H", len(opaque)) + opaque
+    if opaque_field if opaque_field is not None else version >= 0x12:
+        message += struct.pack("<H", len(opaque)) + opaque
     return message
 
 

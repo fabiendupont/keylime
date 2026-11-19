@@ -41,14 +41,28 @@ def _make_chain_blob(cert):
     return struct.pack("<H", len(body)) + body
 
 
-def _make_signed_message(device_key, nonce):
-    block = MeasurementBlock(index=1, measurement_spec=1, dmtf_spec=1, value_type=2, value=b"\xaa" * 48)
-    record = struct.pack("<BBBBH", block.index, block.measurement_spec, block.dmtf_spec, block.value_type, len(block.value)) + block.value
+def _make_signed_message(device_key, nonce, responder_nonce=None, include_transcript=False):
+    """Build a signed MEASUREMENTS statement in the DSP0274 wire format.
 
-    message = struct.pack("<BBBBB", 0x12, 0x60, 0x00, 0x00, 1)
-    message += struct.pack("<I", len(record)) + record
-    message += nonce
-    message += struct.pack("<H", 0)
+    By default a bare response whose responder nonce is the given nonce (legacy collector behavior).
+    With include_transcript=True, builds a full L2 transcript: GET_MEASUREMENTS request carrying the
+    requester's (verifier's) nonce, followed by a response with an independently generated responder
+    nonce — the conformant flow, where freshness rests on the signed request.
+    """
+    block = MeasurementBlock(index=1, measurement_spec=1, value_type=2, value=b"\xaa" * 48)
+    measurement = struct.pack("<BH", block.value_type, len(block.value)) + block.value
+    record = struct.pack("<BBH", block.index, block.measurement_spec, len(measurement)) + measurement
+
+    response = struct.pack("<BBBBB", 0x12, 0x60, 0x00, 0x00, 1)
+    response += struct.pack("<I", len(record)) + record
+    response += responder_nonce or nonce
+    response += struct.pack("<H", 0)
+
+    message = b""
+    if include_transcript:
+        # GET_MEASUREMENTS request: version, code(0xE0), param1, param2, nonce(32), slot(1)
+        message += struct.pack("<BBBB", 0x12, 0xE0, 0x01, 0x00) + nonce + b"\x00"
+    message += response
 
     signature = device_key.sign(message, ec.ECDSA(hashes.SHA384()))
     return message, signature
@@ -106,6 +120,35 @@ class TestSPDMEngine(unittest.TestCase):
         self.assertEqual(self.mock_attestation.evaluation, "pass")
         self.assertFalse(self.mock_attestation.failure_reason)
         self.assertIn("measurements", self.mock_item.results.meta)
+
+    def test_verify_evidence_pass_transcript_freshness(self):
+        # Conformant flow: the responder generates its own nonce; freshness rests on the signed
+        # GET_MEASUREMENTS request carrying the verifier's challenge
+        message, signature = _make_signed_message(
+            self.device_key, self.nonce, responder_nonce=b"\x55" * 32, include_transcript=True
+        )
+        self.mock_item.data.message = message
+        self.mock_item.data.signature = signature
+
+        with patch.object(self.engine, "_trust_store", self._trust_store):
+            self.engine.verify_evidence()
+
+        self.assertEqual(self.mock_attestation.evaluation, "pass")
+        self.assertFalse(self.mock_attestation.failure_reason)
+
+    def test_verify_evidence_stale_transcript(self):
+        # Transcript present but the request carries a nonce other than the verifier's challenge
+        message, signature = _make_signed_message(
+            self.device_key, b"\x66" * 32, responder_nonce=b"\x55" * 32, include_transcript=True
+        )
+        self.mock_item.data.message = message
+        self.mock_item.data.signature = signature
+
+        with patch.object(self.engine, "_trust_store", self._trust_store):
+            self.engine.verify_evidence()
+
+        self.assertEqual(self.mock_attestation.evaluation, "fail")
+        self.assertEqual(self.mock_attestation.failure_reason, "broken_evidence_chain")
 
     def test_verify_evidence_bad_signature(self):
         message, _ = _make_signed_message(self.device_key, self.nonce)

@@ -7,15 +7,27 @@ deliberately not a full SPDM protocol stack: the BMC acts as the SPDM
 requester and this code only consumes the signed MEASUREMENTS response
 produced by the peripheral's hardware root of trust.
 
-Structures follow the SPDM 1.x wire format:
+Structures follow the DMTF DSP0274 wire format:
 
     MEASUREMENTS response (with signature):
         SPDMVersion(1) SPDMMessageCode(1) Param1(1) Param2(1)
-        NumberOfBlocks(1) MeasurementRecordLength(4)
+        NumberOfBlocks(1) MeasurementRecordLength(3 in SPDM 1.0/1.1, 4 from 1.2 on)
         MeasurementRecord(var)
         Nonce(32)
-        OpaqueDataLength(2) OpaqueData(var)
+        OpaqueDataLength(2) OpaqueData(var)    [SPDM 1.2+]
         Signature(var)
+
+    Each measurement block in the record is two-level (all SPDM versions):
+        Index(1) MeasurementSpecification(1) MeasurementSize(2)
+        DMTFSpecMeasurementValueType(1) ValueSize(2) Value(var)
+    where MeasurementSize covers the inner DMTF measurement, i.e.
+    MeasurementSize == 3 + ValueSize.
+
+    Note on SPDM 1.1: DSP0274 1.1 defines no OpaqueDataLength field in the
+    MEASUREMENTS response (the signature follows the nonce directly). Some
+    SPDM 1.1 responders — notably Microchip CEC173x eRoTs found in NVIDIA
+    HGX racks — emit a 1.2-style OpaqueDataLength anyway. Both layouts are
+    accepted for 1.0/1.1 messages.
 
     Certificate chain (SPDM CERTIFICATE response body):
         TotalLength(2) then, for each certificate, Length(2) + CertificateData(var)
@@ -38,7 +50,9 @@ from keylime import keylime_logging
 logger = keylime_logging.init_logging("spdm")
 
 SPDM_MEASUREMENTS = 0x60
+SPDM_GET_MEASUREMENTS = 0xE0
 SPDM_NONCE_SIZE = 32
+SPDM_VERSIONS = (0x10, 0x11, 0x12, 0x13)
 
 
 class SpdmError(Exception):
@@ -47,13 +61,20 @@ class SpdmError(Exception):
 
 @dataclass(frozen=True)
 class MeasurementBlock:
-    """A single SPDM measurement block (DMTF measurement spec)."""
+    """A single SPDM measurement block (DSP0274 MeasurementBlock, DMTF measurement spec)."""
 
     index: int
     measurement_spec: int
-    dmtf_spec: int
     value_type: int
     value: bytes
+
+
+def _record_length_size(version: int) -> int:
+    """Size in bytes of the MeasurementRecordLength field for the given SPDM version.
+
+    DSP0274 defines the field as uint24 in SPDM 1.0/1.1 and widens it to uint32 from SPDM 1.2 on.
+    """
+    return 3 if version <= 0x11 else 4
 
 
 def parse_cert_chain(blob: bytes) -> list[x509.Certificate]:
@@ -122,20 +143,39 @@ def parse_measurements(message: bytes) -> tuple[list[MeasurementBlock], bytes, i
     """Parse the (unsigned portion of an) SPDM MEASUREMENTS response.
 
     Returns a tuple of (measurement blocks, nonce, opaque data length). The
-    signature itself must be stripped by the caller before calling this.
+    signature itself must be stripped by the caller before calling this. The
+    message must end exactly at the end of the opaque data (or the nonce, for
+    strict SPDM 1.0/1.1 responses without the OpaqueDataLength field).
+
+    Conforms to DMTF DSP0274 for all versions:
+
+    - SPDM 1.0/1.1: MeasurementRecordLength is a 3-byte uint24; the message
+      ends at the nonce. The de-facto variant implemented by Microchip
+      CEC173x responders (see note in the module docstring), which appends a
+      1.2-style OpaqueDataLength field, is also accepted.
+    - SPDM 1.2+: MeasurementRecordLength is a 4-byte uint32 and is followed,
+      after the nonce, by OpaqueDataLength and OpaqueData.
+    - Measurement blocks are two-level in all versions:
+      Index(1) MeasurementSpecification(1) MeasurementSize(2), wrapping the
+      DMTF measurement DMTFSpecMeasurementValueType(1) ValueSize(2) Value,
+      with MeasurementSize == 3 + ValueSize enforced.
     """
     if len(message) < 8:
         raise SpdmError("SPDM measurements message is too short")
 
     version, code, _param1, _param2 = struct.unpack_from("<BBBB", message, 0)
-    if version not in (0x10, 0x11, 0x12, 0x13):
+    if version not in SPDM_VERSIONS:
         raise SpdmError(f"unsupported SPDM version 0x{version:02x} in measurements message")
     if code != SPDM_MEASUREMENTS:
         raise SpdmError(f"message code 0x{code:02x} is not an SPDM MEASUREMENTS response")
 
     number_of_blocks = message[4]
-    record_length = struct.unpack_from("<I", message, 5)[0]
-    offset = 9
+    length_size = _record_length_size(version)
+    if len(message) < 5 + length_size:
+        raise SpdmError("SPDM measurements message is truncated before measurement record length")
+
+    record_length = int.from_bytes(message[5 : 5 + length_size], "little")
+    offset = 5 + length_size
 
     if offset + record_length > len(message):
         raise SpdmError("SPDM measurement record length exceeds message size")
@@ -144,20 +184,35 @@ def parse_measurements(message: bytes) -> tuple[list[MeasurementBlock], bytes, i
     blocks: list[MeasurementBlock] = []
 
     while offset < record_end:
-        if offset + 6 > record_end:
+        # MeasurementBlock: Index(1) MeasurementSpecification(1) MeasurementSize(2)
+        if offset + 4 > record_end:
             raise SpdmError("truncated measurement block in SPDM measurements message")
-        index, measurement_spec, dmtf_spec, value_type = struct.unpack_from("<BBBB", message, offset)
-        value_size = struct.unpack_from("<H", message, offset + 4)[0]
-        offset += 6
-        if offset + value_size > record_end:
-            raise SpdmError("measurement block value exceeds measurement record length")
-        value = message[offset : offset + value_size]
-        offset += value_size
+        index = message[offset]
+        measurement_spec = message[offset + 1]
+        measurement_size = struct.unpack_from("<H", message, offset + 2)[0]
+        offset += 4
+
+        if offset + measurement_size > record_end:
+            raise SpdmError("measurement block exceeds measurement record length")
+        measurement = message[offset : offset + measurement_size]
+        offset += measurement_size
+
+        # DMTF measurement: DMTFSpecMeasurementValueType(1) ValueSize(2) Value
+        if measurement_size < 3:
+            raise SpdmError(f"measurement block {index} is too short to contain a DMTF measurement")
+        value_type = measurement[0]
+        value_size = struct.unpack_from("<H", measurement, 1)[0]
+        if 3 + value_size != measurement_size:
+            raise SpdmError(
+                f"measurement block {index} inner size {value_size} is inconsistent with "
+                f"MeasurementSize {measurement_size}"
+            )
+        value = measurement[3:]
+
         blocks.append(
             MeasurementBlock(
                 index=index,
                 measurement_spec=measurement_spec,
-                dmtf_spec=dmtf_spec,
                 value_type=value_type,
                 value=value,
             )
@@ -168,11 +223,29 @@ def parse_measurements(message: bytes) -> tuple[list[MeasurementBlock], bytes, i
             f"SPDM measurements message reports {number_of_blocks} blocks but {len(blocks)} could be parsed"
         )
 
-    if record_end + SPDM_NONCE_SIZE + 2 > len(message):
+    # Nonce (responder-generated; the requester's nonce is never echoed — see find_request_nonce)
+    nonce_end = record_end + SPDM_NONCE_SIZE
+    if nonce_end > len(message):
         raise SpdmError("SPDM measurements message is truncated before nonce")
+    nonce = message[record_end:nonce_end]
 
-    nonce = message[record_end : record_end + SPDM_NONCE_SIZE]
-    opaque_length = struct.unpack_from("<H", message, record_end + SPDM_NONCE_SIZE)[0]
+    if version >= 0x12:
+        # SPDM 1.2+: OpaqueDataLength + OpaqueData, and the message ends exactly there
+        if nonce_end + 2 > len(message):
+            raise SpdmError("SPDM measurements message is truncated before opaque data length")
+        opaque_length = struct.unpack_from("<H", message, nonce_end)[0]
+        if nonce_end + 2 + opaque_length != len(message):
+            raise SpdmError("SPDM measurements message has trailing data after opaque data")
+    elif nonce_end == len(message):
+        # Strict DSP0274 1.0/1.1: the message ends at the nonce
+        opaque_length = 0
+    else:
+        # De-facto SPDM 1.1 (Microchip CEC173x): a 1.2-style OpaqueDataLength field is present
+        if nonce_end + 2 > len(message):
+            raise SpdmError("SPDM measurements message is truncated before opaque data length")
+        opaque_length = struct.unpack_from("<H", message, nonce_end)[0]
+        if nonce_end + 2 + opaque_length != len(message):
+            raise SpdmError("SPDM measurements message has trailing data after opaque data")
 
     return blocks, nonce, opaque_length
 
@@ -180,35 +253,59 @@ def parse_measurements(message: bytes) -> tuple[list[MeasurementBlock], bytes, i
 def locate_measurements_message(transcript: bytes) -> int:
     """Locate the SPDM MEASUREMENTS response within a signed statement.
 
-    SPDM-capable BMCs sign the full L2 measurement transcript — VCA (the version/capabilities/algorithms
-    negotiation) followed by the GET_MEASUREMENTS request and the MEASUREMENTS response. The `SignedMeasurements`
-    blob conveyed by Redfish is that transcript with the signature appended.
+    SPDM-capable BMCs sign the measurement transcript — the GET_MEASUREMENTS request followed by the
+    MEASUREMENTS response. The `SignedMeasurements` blob conveyed by Redfish is that transcript with
+    the signature appended.
 
     This function scans for the MEASUREMENTS response (the only message with code 0x60 in the transcript)
     and returns its offset. A bare (transcript-less) response is simply found at offset 0. The located
     message must end exactly at the end of the buffer: the MEASUREMENTS response is always the last
     message of the transcript, immediately preceding the signature.
 
+    Handles the version-dependent layouts described in the module docstring: 3-byte
+    MeasurementRecordLength with or without the OpaqueDataLength field (SPDM 1.0/1.1), and 4-byte
+    MeasurementRecordLength with OpaqueDataLength (SPDM 1.2+).
+
     :raises SpdmError: no well-formed MEASUREMENTS response ending at the buffer end was found
     """
     if len(transcript) < 9:
         raise SpdmError("signed SPDM statement is too short to contain a MEASUREMENTS response")
 
-    for offset in range(0, len(transcript) - 8):
+    for offset in range(0, len(transcript) - 7):
         # SPDM message header: version(1) code(1) param1(1) param2(1)
         if transcript[offset + 1] != SPDM_MEASUREMENTS:
             continue
 
-        # Candidate: validate the internal structure and require an exact fit to the buffer end
-        record_length = struct.unpack_from("<I", transcript, offset + 5)[0]
-        nonce_end = offset + 9 + record_length + SPDM_NONCE_SIZE
-        if nonce_end + 2 > len(transcript):
+        spdm_version = transcript[offset]
+        if spdm_version not in SPDM_VERSIONS:
             continue
 
-        opaque_length = struct.unpack_from("<H", transcript, nonce_end)[0]
-        message_end = nonce_end + 2 + opaque_length
+        length_size = _record_length_size(spdm_version)
+        if offset + 5 + length_size > len(transcript):
+            continue
 
-        if message_end != len(transcript):
+        # Candidate: validate the internal structure and require an exact fit to the buffer end
+        record_length = int.from_bytes(transcript[offset + 5 : offset + 5 + length_size], "little")
+        nonce_end = offset + 5 + length_size + record_length + SPDM_NONCE_SIZE
+        if nonce_end > len(transcript):
+            continue
+
+        if spdm_version >= 0x12:
+            # SPDM 1.2+: Nonce || OpaqueDataLength(2) || OpaqueData
+            if nonce_end + 2 > len(transcript):
+                continue
+            opaque_length = struct.unpack_from("<H", transcript, nonce_end)[0]
+            if nonce_end + 2 + opaque_length != len(transcript):
+                continue
+        elif nonce_end == len(transcript):
+            # Strict DSP0274 1.0/1.1: the message ends at the nonce
+            pass
+        elif nonce_end + 2 <= len(transcript):
+            # De-facto SPDM 1.1 (Microchip CEC173x): Nonce || OpaqueDataLength(2) || OpaqueData
+            opaque_length = struct.unpack_from("<H", transcript, nonce_end)[0]
+            if nonce_end + 2 + opaque_length != len(transcript):
+                continue
+        else:
             continue
 
         # A candidate that structurally fits is the response; validate it fully by parsing
@@ -311,11 +408,30 @@ def _decode_ecdsa_signature(signature: bytes, curve: ec.EllipticCurve) -> bytes:
     return signature
 
 
+def find_request_nonce(transcript: bytes) -> Optional[bytes]:
+    """Return the nonce carried by the GET_MEASUREMENTS request in a signed SPDM transcript.
+
+    DSP0274 never echoes the requester's nonce in the MEASUREMENTS response — the responder
+    generates its own. Freshness of the evidence therefore rests on transcript coverage: the
+    GET_MEASUREMENTS request containing the requester's (verifier's) nonce is part of the signed
+    statement. This function locates that request and extracts its nonce.
+
+    The GET_MEASUREMENTS request is: version(1) code(0xE0) param1(1) param2(1) nonce(32) slot(1).
+
+    :returns: the 32-byte request nonce, or None if no GET_MEASUREMENTS request is present
+    """
+    for offset in range(0, max(0, len(transcript) - 4 - SPDM_NONCE_SIZE) + 1):
+        if transcript[offset] in SPDM_VERSIONS and transcript[offset + 1] == SPDM_GET_MEASUREMENTS:
+            return transcript[offset + 4 : offset + 4 + SPDM_NONCE_SIZE]
+    return None
+
+
 def find_nonce_offset(message: bytes) -> int:
     """Return the offset of the nonce field within an SPDM MEASUREMENTS message."""
     _blocks, _nonce, _opaque = parse_measurements(message)
-    record_length = struct.unpack_from("<I", message, 5)[0]
-    return 9 + record_length
+    version = message[0]
+    record_length = int.from_bytes(message[5 : 5 + _record_length_size(version)], "little")
+    return 5 + _record_length_size(version) + record_length
 
 
 def split_signed_message(response: bytes, signature_length: Optional[int] = None) -> tuple[bytes, bytes]:

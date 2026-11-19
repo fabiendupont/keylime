@@ -75,8 +75,8 @@ class TestCorim(unittest.TestCase):
             f.write(self.signer_cert.public_bytes(serialization.Encoding.PEM))
 
         self.blocks = [
-            MeasurementBlock(index=1, measurement_spec=1, dmtf_spec=1, value_type=2, value=b"\xaa" * 48),
-            MeasurementBlock(index=2, measurement_spec=1, dmtf_spec=1, value_type=3, value=b"\xbb" * 48),
+            MeasurementBlock(index=1, measurement_spec=1, value_type=2, value=b"\xaa" * 48),
+            MeasurementBlock(index=2, measurement_spec=1, value_type=3, value=b"\xbb" * 48),
         ]
         self.digests = {1: ("aa" * 48), 2: ("bb" * 48)}
 
