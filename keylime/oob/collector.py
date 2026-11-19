@@ -318,6 +318,16 @@ class OOBCollector:
 
         if response.status_code == 401 and self.tpm:
             self.authenticate()
+
+            # The verifier may have lost the agent's enrollment (for example after a restart with
+            # ephemeral storage): re-enroll and re-authenticate before giving up on this cycle
+            if not self.token:
+                logger.warning(
+                    "Session authentication failed for agent '%s'; re-enrolling with the verifier", self.agent_id
+                )
+                self.enroll_with_verifier()
+                self.authenticate()
+
             response = self.http.post(
                 f"{self.verifier_base_url}/v{API_VERSION}/agents/{self.agent_id}/attestations",
                 json=self._json_api({"evidence_supported": capabilities, "system_info": {"boot_time": boot_time}}),
