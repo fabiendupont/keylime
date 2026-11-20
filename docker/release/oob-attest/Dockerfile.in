@@ -4,7 +4,8 @@ MAINTAINER Keylime Team <main@keylime.groups.io>
 
 # Standalone build (not derived from keylime_base): the collector requires
 # tpm2-tools >= 5.8 for tpm2_certify qualifying data (session proof of
-# possession), which the current Fedora 44 based keylime_base does not ship.
+# possession), which the UBI 10 based keylime_base does not ship (UBI 10
+# has tpm2-tools 5.7).  This image therefore stays Fedora-based.
 RUN dnf -y install \
     awk \
     dnf-plugins-core \

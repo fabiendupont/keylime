@@ -1,15 +1,42 @@
-FROM quay.io/fedora/fedora@sha256:7011f51bd8089d345be42d41f0aa3190d258823528852a5e7ec976fe2fd20f53 AS keylime_base
+FROM registry.access.redhat.com/ubi10/ubi@sha256:73ea54bfbfb586075bd3d45df6483a7f68875233c8cc7cebcf9b2bb42306c308 AS keylime_base
 LABEL version="_version_" description="Keylime Base - Only used as an base image for derived packages"
 MAINTAINER Keylime Team <main@keylime.groups.io>
 
-RUN dnf -y install \
-    awk \
-    dnf-plugins-core \
-    efivar-devel \
-    efivar-libs \
+# UBI 10 base image (Python 3.12).  All RPM-available dependencies are
+# installed from the subscription-free ubi-10-* (and codeready-builder)
+# repositories only; the rhel-10-* repositories require RHEL entitlements
+# that container builds do not have, so they are disabled explicitly.
+#
+# Python dependencies without a UBI 10 RPM (cbor2, tornado, sqlalchemy,
+# alembic, pyzmq, lark are RHEL AppStream packages) are installed via
+# pip from requirements.txt, same as the Fedora-based images; the
+# RPM-provided ones are seen as already satisfied and skipped by pip.
+#
+# Note: docker/release/oob-attest stays Fedora-based because the
+# collector requires tpm2-tools >= 5.8 while UBI 10 ships 5.7.
+
+RUN dnf -y --disablerepo='rhel-10*' install \
+    gawk \
     git \
     nc \
-    python3-PyMySQL \
+    python3-cryptography \
+    python3-gpg \
     python3-jinja2 \
+    python3-jsonschema \
+    python3-packaging \
+    python3-pip \
+    python3-PyMySQL \
     python3-psycopg2 \
-    tpm2-tools
+    python3-pyasn1 \
+    python3-pyasn1-modules \
+    python3-psutil \
+    python3-pyyaml \
+    python3-requests \
+    python3-setuptools \
+    tpm2-tools \
+    tpm2-tss \
+    && dnf clean all
+
+# Pip-only dependencies (no UBI 10 RPM available), from requirements.txt
+RUN --mount=target=/keylime,type=bind,source=.,rw \
+    pip3 install --no-cache-dir --break-system-packages -r /keylime/requirements.txt

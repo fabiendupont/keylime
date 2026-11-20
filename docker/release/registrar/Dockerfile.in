@@ -2,8 +2,23 @@ FROM _source_keylime_base_digest_ AS keylime_registrar
 LABEL version="_version_" description="Keylime Registrar - Bootstrapping and Maintaining Trust in the Cloud"
 MAINTAINER Keylime Team <main@keylime.groups.io>
 
+# Dependencies are provided by the keylime_base image (UBI 10 RPMs plus
+# requirements.txt-installed pip packages), so keylime itself is installed from source without
+# re-resolving dependencies (pip sees the base image ones as satisfied).
 RUN --mount=target=/keylime,type=bind,source=.,rw \
-    cd /keylime && ./installer.sh -o
+    cd /keylime && \
+    python3 -m pip install --no-deps --break-system-packages . && \
+    mkdir -p /etc/keylime && \
+    python3 -m keylime.cmd.convert_config --defaults --out config --templates templates && \
+    for comp in agent verifier tenant registrar ca logging; do \
+        mkdir -p /etc/keylime/$comp.conf.d && \
+        cp config/$comp.conf /etc/keylime/ && \
+        chmod 600 /etc/keylime/$comp.conf; \
+    done && \
+    mkdir -p /usr/share/keylime && \
+    cp -r templates /usr/share/keylime/templates && \
+    mkdir -p /var/lib/keylime && \
+    cp -r tpm_cert_store /var/lib/keylime/tpm_cert_store
 
 # OpenShift's restricted SCC runs containers as a randomized non-root UID: make
 # the configuration files world-readable and the working directory writable so

@@ -27,21 +27,23 @@ if [ -z "$CONTAINER_ENGINE" ]; then
     fi
 fi
 
-FEDORA_IMAGE="${REGISTRY}/fedora/fedora"
-QUERY_RESULT="$(skopeo inspect docker://${FEDORA_IMAGE}:latest)"
+# The base image is built on Red Hat UBI 10 (subscription-free ubi-10-*
+# repositories); the oob-attest image is standalone and stays Fedora-based.
+BASE_IMAGE="registry.access.redhat.com/ubi10/ubi"
+QUERY_RESULT="$(skopeo inspect docker://${BASE_IMAGE}:latest)"
 ret=$?
 if [[ $ret -eq 127 ]]; then
-    echo "Failed to get latest Fedora image digest. Please install skopeo."
+    echo "Failed to get latest UBI 10 image digest. Please install skopeo."
     exit 127
 elif [[ $ret -ne 0 ]]; then
-    echo "Failed to get latest Fedora image digest."
+    echo "Failed to get latest UBI 10 image digest."
     exit $ret
 else
-    FEDORA_DIGEST="$(jq '.Digest' <<<"$QUERY_RESULT")"
+    BASE_DIGEST="$(jq '.Digest' <<<"$QUERY_RESULT")"
 fi
 
 # Prepare base image Dockerfile
-sed -i "s#\(FROM \)[^ ]*#\1${FEDORA_IMAGE}@${FEDORA_DIGEST}#" base/Dockerfile.in
+sed -i "s#\(FROM \)[^ ]*#\1${BASE_IMAGE}@${BASE_DIGEST}#" base/Dockerfile.in
 sed "s#_version_#${VERSION}#" base/Dockerfile.in > base/Dockerfile
 
 # Prepare other components Dockerfile
