@@ -98,6 +98,38 @@ class TestCorim(unittest.TestCase):
         self.assertEqual(reference[1], {self.digests[1]})
         self.assertEqual(appraise_measurements(self.blocks, reference), [])
 
+    def test_parse_accepts_frozen_containers(self):
+        """cbor2 >= 6.3 decodes CBOR-tagged maps/arrays as frozendict/tuple rather than dict/list; the
+        parser must accept any Mapping/Sequence. Simulate that decoding by wrapping cbor2.loads to
+        deep-freeze every decoded structure."""
+        from types import MappingProxyType
+        from unittest.mock import patch
+
+        import cbor2
+        from keylime.corim import parse_corim
+
+        real_loads = cbor2.loads
+
+        def freeze(value):
+            if isinstance(value, dict):
+                return MappingProxyType({k: freeze(v) for k, v in value.items()})
+            if isinstance(value, list):
+                return tuple(freeze(v) for v in value)
+            return value
+
+        def frozen_loads(data):
+            return freeze(real_loads(data))
+
+        path = self._write_signed_corim()
+        payload = load_and_verify(path, self.trust_dir.name)
+
+        with patch.object(cbor2, "loads", frozen_loads):
+            reference = parse_corim(payload)
+
+        self.assertEqual(set(reference.keys()), {1, 2})
+        self.assertEqual(reference[1], {self.digests[1]})
+        self.assertEqual(appraise_measurements(self.blocks, reference), [])
+
     def test_appraise_detects_mismatch(self):
         path = self._write_signed_corim(digests={1: "aa" * 48, 2: "cc" * 48})  # block 2 differs
         payload = load_and_verify(path, self.trust_dir.name)

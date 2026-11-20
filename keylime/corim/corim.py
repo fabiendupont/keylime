@@ -20,6 +20,8 @@ import hashlib
 import os
 from typing import Any, Optional, Union
 
+from collections.abc import Mapping, Sequence
+
 import cbor2
 from cryptography import x509
 from cryptography.hazmat.primitives.serialization import Encoding
@@ -71,7 +73,7 @@ class CorimError(Exception):
 def _digest_hex(digest_entry: Any) -> Optional[str]:
     """Extract a digest as a hex string from a CoMID digest entry, which may be a map
     ({alg-id: int, digest: bytes}, in either label order) or a 2-element array."""
-    if isinstance(digest_entry, dict):
+    if isinstance(digest_entry, Mapping):
         if 2 in digest_entry and isinstance(digest_entry[2], bytes):
             return digest_entry[2].hex()
         if 1 in digest_entry and isinstance(digest_entry[1], bytes):
@@ -79,7 +81,7 @@ def _digest_hex(digest_entry: Any) -> Optional[str]:
         for value in digest_entry.values():
             if isinstance(value, bytes):
                 return value.hex()
-    elif isinstance(digest_entry, (list, tuple)) and len(digest_entry) == 2:
+    elif isinstance(digest_entry, Sequence) and not isinstance(digest_entry, (str, bytes)) and len(digest_entry) == 2:
         if isinstance(digest_entry[1], bytes):
             return digest_entry[1].hex()
     return None
@@ -164,12 +166,12 @@ def _decode_comid(tag: Any) -> Any:
 def _normalize_measurement_maps(measurements: Any) -> list:
     """The CoMID 'measurements' member appears either as a list of measurement maps or as a map keyed by
     an integer (typically 0) containing that list; normalize to the list."""
-    if isinstance(measurements, dict):
+    if isinstance(measurements, Mapping):
         for value in measurements.values():
-            if isinstance(value, list):
+            if isinstance(value, Sequence) and not isinstance(value, (str, bytes)):
                 return value
         raise CorimError("CoMID measurements map does not contain a list of measurement maps")
-    if isinstance(measurements, list):
+    if isinstance(measurements, Sequence) and not isinstance(measurements, (str, bytes)):
         return measurements
     raise CorimError("CoMID measurements member has an unexpected type")
 
@@ -177,10 +179,10 @@ def _normalize_measurement_maps(measurements: Any) -> list:
 def _measurement_key_components(m_key: Any) -> Optional[dict]:
     """Extract the device identity components (environment class, vendor, model, instance) from a
     measurement-map key."""
-    if not isinstance(m_key, dict) or 0 not in m_key:
+    if not isinstance(m_key, Mapping) or 0 not in m_key:
         return None
     env = m_key[0]
-    if not isinstance(env, dict):
+    if not isinstance(env, Mapping):
         return None
     class_id = env.get(0)
     if isinstance(class_id, cbor2.CBORTag):
@@ -205,19 +207,19 @@ def _measurement_digests(m_val: Any) -> list[str]:
     2-element array whose final element is the digest bytes."""
     digests: list[str] = []
 
-    if not isinstance(m_val, list):
+    if not isinstance(m_val, Sequence) or isinstance(m_val, (str, bytes)):
         return digests
 
     for attrs in m_val:
-        if not isinstance(attrs, dict):
+        if not isinstance(attrs, Mapping):
             continue
 
         digest_container = attrs.get(MEASUREMENT_DIGESTS)
-        if not isinstance(digest_container, dict):
+        if not isinstance(digest_container, Mapping):
             continue
 
         entries = digest_container.get(MEASUREMENT_DIGEST_LIST)
-        if not isinstance(entries, list):
+        if not isinstance(entries, Sequence) or isinstance(entries, (str, bytes)):
             continue
 
         for entry in entries:
@@ -239,11 +241,11 @@ def _indexed_digests(m_val: Any) -> list[tuple[int, list[str]]]:
     results: list[tuple[int, list[str]]] = []
     current_index: Optional[int] = None
 
-    if not isinstance(m_val, list):
+    if not isinstance(m_val, Sequence) or isinstance(m_val, (str, bytes)):
         return results
 
     for attrs in m_val:
-        if not isinstance(attrs, dict):
+        if not isinstance(attrs, Mapping):
             continue
 
         index = attrs.get(MEASUREMENT_INDEX)
@@ -251,9 +253,9 @@ def _indexed_digests(m_val: Any) -> list[tuple[int, list[str]]]:
             current_index = index
 
         digest_container = attrs.get(MEASUREMENT_DIGESTS)
-        if isinstance(digest_container, dict):
+        if isinstance(digest_container, Mapping):
             entries = digest_container.get(MEASUREMENT_DIGEST_LIST)
-            if isinstance(entries, list):
+            if isinstance(entries, Sequence) and not isinstance(entries, (str, bytes)):
                 digests = [d for d in (_digest_hex(e) for e in entries) if d]
                 if digests and current_index is not None:
                     results.append((current_index, digests))
@@ -272,28 +274,28 @@ def parse_corim(cbor_bytes: bytes) -> dict[int, set[str]]:
     """
     corim = _decode_tagged(_unwrap_cose(cbor_bytes), CORIM_TAG)
 
-    if not isinstance(corim, dict):
+    if not isinstance(corim, Mapping):
         raise CorimError("CoRIM is not a CBOR map")
 
     tags = corim.get(RIM_TAGS)
 
-    if not isinstance(tags, list):
+    if not isinstance(tags, Sequence) or isinstance(tags, (str, bytes)):
         raise CorimError("CoRIM does not contain a 'tags' member with CoMIDs")
 
     measurements: dict[int, set[str]] = {}
 
     for tag in tags:
         comid = _decode_comid(tag)
-        if not isinstance(comid, dict):
+        if not isinstance(comid, Mapping):
             continue
 
         measurement_maps = _normalize_measurement_maps(comid.get(COMID_MEASUREMENTS))
 
         for measurement_map in measurement_maps:
             # Measurement maps appear either as [m-key, m-val] arrays or as {m-key: m-val} dicts
-            if isinstance(measurement_map, dict):
+            if isinstance(measurement_map, Mapping):
                 pairs = measurement_map.items()
-            elif isinstance(measurement_map, list) and len(measurement_map) == 2:
+            elif isinstance(measurement_map, Sequence) and not isinstance(measurement_map, (str, bytes)) and len(measurement_map) == 2:
                 pairs = [(measurement_map[0], measurement_map[1])]
             else:
                 continue
@@ -318,26 +320,26 @@ def parse_corim_devices(cbor_bytes: bytes) -> dict[str, dict[int, set[str]]]:
     """
     corim = _decode_tagged(_unwrap_cose(cbor_bytes), CORIM_TAG)
 
-    if not isinstance(corim, dict):
+    if not isinstance(corim, Mapping):
         raise CorimError("CoRIM is not a CBOR map")
 
     tags = corim.get(RIM_TAGS)
-    if not isinstance(tags, list):
+    if not isinstance(tags, Sequence) or isinstance(tags, (str, bytes)):
         raise CorimError("CoRIM does not contain a 'tags' member with CoMIDs")
 
     devices: dict[str, dict[int, set[str]]] = {}
 
     for tag in tags:
         comid = _decode_comid(tag)
-        if not isinstance(comid, dict):
+        if not isinstance(comid, Mapping):
             continue
 
         measurement_maps = _normalize_measurement_maps(comid.get(COMID_MEASUREMENTS))
 
         for measurement_map in measurement_maps:
-            if isinstance(measurement_map, dict):
+            if isinstance(measurement_map, Mapping):
                 pairs = measurement_map.items()
-            elif isinstance(measurement_map, list) and len(measurement_map) == 2:
+            elif isinstance(measurement_map, Sequence) and not isinstance(measurement_map, (str, bytes)) and len(measurement_map) == 2:
                 pairs = [(measurement_map[0], measurement_map[1])]
             else:
                 continue
@@ -560,7 +562,7 @@ def load_and_verify(path: str, trust_dir: str) -> bytes:
 def _looks_like_plain_corim(blob: bytes) -> bool:
     try:
         parsed = cbor2.loads(blob)
-        return isinstance(parsed, dict) and RIM_TAGS in parsed
+        return isinstance(parsed, Mapping) and RIM_TAGS in parsed
     except Exception:
         return False
 
